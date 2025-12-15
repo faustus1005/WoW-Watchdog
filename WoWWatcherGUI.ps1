@@ -381,13 +381,13 @@ $xaml = @"
                 <Button x:Name="BtnBrowseMySQL" Grid.Row="0" Grid.Column="2" Content="Browse" MinWidth="80"
                         Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
 
-                <TextBlock Grid.Row="1" Grid.Column="0" Text="Authserver.exe:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Authserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
                 <TextBox x:Name="TxtAuth" Grid.Row="1" Grid.Column="1" Margin="4,2"
                          Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
                 <Button x:Name="BtnBrowseAuth" Grid.Row="1" Grid.Column="2" Content="Browse" MinWidth="80"
                         Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
 
-                <TextBlock Grid.Row="2" Grid.Column="0" Text="Worldserver.exe:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Worldserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
                 <TextBox x:Name="TxtWorld" Grid.Row="2" Grid.Column="1" Margin="4,2"
                          Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
                 <Button x:Name="BtnBrowseWorld" Grid.Row="2" Grid.Column="2" Content="Browse" MinWidth="80"
@@ -974,14 +974,39 @@ function Pick-File {
 }
 
 # -------------------------------------------------
+# Process name aliases (WoW server variants)
+# -------------------------------------------------
+$ProcessAliases = @{
+    MySQL       = @("mysqld")
+    Authserver  = @("authserver", "bnetserver", "logonserver", "realmd", "auth")
+    Worldserver = @("worldserver")
+}
+
+# -------------------------------------------------
 # Process helper
 # -------------------------------------------------
 function Get-ProcessSafe {
-    param([string]$Name)
-    try {
-        return Get-Process -Name $Name -ErrorAction SilentlyContinue
-    } catch { return $null }
+    param(
+        [Parameter(Mandatory)]
+        [string]$Role
+    )
+
+    if (-not $ProcessAliases.ContainsKey($Role)) {
+        return $null
+    }
+
+    foreach ($name in $ProcessAliases[$Role]) {
+        try {
+            $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
+            if ($proc) {
+                return $proc
+            }
+        } catch { }
+    }
+
+    return $null
 }
+
 
 # -------------------------------------------------
 # Watchdog process state + NTFY
@@ -1213,7 +1238,7 @@ Timestamp: $ts
 function Initialize-NtfyBaseline {
     try {
         $global:MySqlUp     = [bool](Get-ProcessSafe "mysqld")
-        $global:AuthUp      = [bool](Get-ProcessSafe "authserver")
+        $global:AuthUp = [bool](Get-ProcessSafe "Authserver")
         $global:WorldUp     = [bool](Get-ProcessSafe "worldserver")
         $global:NtfyBaselineInitialized = $true
 
@@ -1229,7 +1254,7 @@ function Initialize-NtfyBaseline {
 # -------------------------------------------------
 function Update-ServiceStates {
     $newMySql  = [bool](Get-ProcessSafe "mysqld")
-    $newAuth   = [bool](Get-ProcessSafe "authserver")
+    $newAuth = [bool](Get-ProcessSafe "Authserver")
     $newWorld  = [bool](Get-ProcessSafe "worldserver")
 
     # MySQL
