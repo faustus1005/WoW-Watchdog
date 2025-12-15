@@ -1,5 +1,5 @@
 # WoW Watchdog (Windows) – Service + GUI
-<p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> </p>
+<p align="left"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> </p>
 
 WoW Watchdog is a Windows PowerShell watchdog that monitors key WoW server processes (MySQL/Authserver/Worldserver) and can send NTFY notifications on state changes.  
 This package includes:
