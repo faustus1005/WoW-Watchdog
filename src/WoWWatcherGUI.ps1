@@ -48,6 +48,52 @@
 
 #>
 
+# -------------------------------------------------
+# Self-elevate to Administrator (EXE-safe + PS1-safe)
+# -------------------------------------------------
+function Test-IsAdmin {
+    try {
+        $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+    } catch {
+        return $false
+    }
+}
+
+if (-not (Test-IsAdmin)) {
+
+    # Relaunch *this process*, not powershell.exe
+    $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+    try {
+        Start-Process -FilePath $exePath -Verb RunAs
+    } catch {
+        [System.Windows.MessageBox]::Show(
+            "WoW Watchdog requires administrative privileges.",
+            "Elevation Required",
+            'OK',
+            'Error'
+        )
+    }
+
+    return
+}
+
+$ErrorActionPreference = 'Stop'
+
+trap {
+    try {
+        $msg = "Unhandled exception:`n$($_)"
+        [System.Windows.MessageBox]::Show($msg, "WoW Watchdog", 'OK', 'Error')
+        Add-Content -Path (Join-Path $env:ProgramData "WoWWatchdog\crash.log") -Value $msg
+    } catch { }
+    break
+}
+
+
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
@@ -55,16 +101,28 @@ Add-Type -AssemblyName WindowsBase
 # -------------------------------------------------
 # Paths / constants
 # -------------------------------------------------
-$ScriptDir        = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ConfigPath       = Join-Path $ScriptDir "config.json"
-$WatchdogPath     = Join-Path $ScriptDir "watchdog.ps1"
-$LogPath          = Join-Path $ScriptDir "watchdog.log"
-$StopSignalFile   = Join-Path $ScriptDir "stop_watchdog.txt"
+# -------------------------------------------------
+# Canonical paths (ProgramData-safe)
+# -------------------------------------------------
+$AppName = "WoWWatchdog"
+
+$ExePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$InstallDir = Split-Path -Parent $ExePath
+$ScriptDir  = $InstallDir
+$DataDir    = Join-Path $env:ProgramData $AppName
+
+if (-not (Test-Path $DataDir)) {
+    New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
+}
+
+$ConfigPath     = Join-Path $DataDir "config.json"
+$LogPath        = Join-Path $DataDir "watchdog.log"
+$StopSignalFile = Join-Path $DataDir "stop_watchdog.txt"
+$HeartbeatFile = Join-Path $DataDir "watchdog.heartbeat"
+$StatusFile    = Join-Path $DataDir "watchdog.status.json"
+
 $ServiceName      = "WoWWatchdog"
 $LegacyServiceName = "MoPWatchdog"
-
-$global:WatchdogPID   = $null
-$global:ExitRequested = $false
 
 # Status flags for LED + NTFY baseline
 $global:MySqlUp       = $false
@@ -123,8 +181,6 @@ try {
         Worldserver = ""
     }
 }
-
-# Ensure root-level metadata exists (backward compatible)
 
 # Ensure root-level metadata exists (backward compatible)
 $defaultRoot = [pscustomobject]@{
@@ -717,7 +773,20 @@ $xaml = @"
 
 [xml]$xamlXml = $xaml
 $xmlReader     = New-Object System.Xml.XmlNodeReader $xamlXml
-$Window        = [Windows.Markup.XamlReader]::Load($xmlReader)
+try {
+    [xml]$xamlXml = $xaml
+    $xmlReader = New-Object System.Xml.XmlNodeReader $xamlXml
+    $Window = [Windows.Markup.XamlReader]::Load($xmlReader)
+} catch {
+    [System.Windows.MessageBox]::Show(
+        "Failed to load GUI XAML:`n`n$($_)",
+        "WoW Watchdog",
+        'OK',
+        'Error'
+    )
+    return
+}
+
 
 # -------------------------------------------------
 # Apply program icon (WoWWatcher.ico preferred; fallback to MoPWatcher.ico)
@@ -815,38 +884,6 @@ function Update-ServiceStatusLabel {
     }
 }
 
-function Start-WatchdogPreferred {
-    $svc = Get-WowWatchdogService
-    if ($svc) {
-        try {
-            if ($svc.Status -ne "Running") { Start-Service -Name $ServiceName }
-            Add-GuiLog "Service started: $ServiceName"
-        } catch {
-            Add-GuiLog "ERROR: Failed to start service ${ServiceName}: $($_)"
-        }
-        return
-    }
-
-    # Fallback to your existing Start-Watchdog (standalone)
-    Start-Watchdog
-}
-
-function Stop-WatchdogPreferred {
-    $svc = Get-WowWatchdogService
-    if ($svc) {
-        try {
-            if ($svc.Status -ne "Stopped") { Stop-Service -Name $ServiceName -Force }
-            Add-GuiLog "Service stopped: $ServiceName"
-        } catch {
-            Add-GuiLog "ERROR: Failed to stop service ${ServiceName}: $($_)"
-        }
-        return
-    }
-
-    # Fallback to your existing Stop-Watchdog (stop signal file)
-    Stop-Watchdog
-}
-
 function Select-ComboItemByContent {
     param(
         [Parameter(Mandatory)][System.Windows.Controls.ComboBox]$Combo,
@@ -892,6 +929,81 @@ function Set-PriorityOverrideCombo {
         [void](Select-ComboItemByContent -Combo $Combo -Content "Auto")
     }
 }
+
+function Update-WatchdogStatusLabel {
+    $svc = Get-WowWatchdogService
+    if (-not $svc) {
+        $TxtWatchdogStatus.Text = "Not installed"
+        $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Orange
+        return
+    }
+
+    if ($svc.Status -ne 'Running') {
+        $TxtWatchdogStatus.Text = "Stopped"
+        $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Orange
+        return
+    }
+
+    # Service is running; validate heartbeat freshness
+    $freshSeconds = 5
+    if (Test-Path $HeartbeatFile) {
+        try {
+            $ts = Get-Content $HeartbeatFile -Raw -ErrorAction Stop
+            $hb = [DateTime]::Parse($ts)
+
+            $age = ((Get-Date) - $hb).TotalSeconds
+            if ($age -le $freshSeconds) {
+                $TxtWatchdogStatus.Text = "Running (Healthy)"
+                $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::LimeGreen
+                return
+            } else {
+                $TxtWatchdogStatus.Text = "Running (Stalled - heartbeat $([int]$age)s old)"
+                $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Yellow
+                return
+            }
+        } catch {
+            $TxtWatchdogStatus.Text = "Running (Heartbeat unreadable)"
+            $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Yellow
+            return
+        }
+    }
+
+    $TxtWatchdogStatus.Text = "Running (No heartbeat file)"
+    $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Yellow
+}
+
+
+function Start-WatchdogPreferred {
+    $svc = Get-WowWatchdogService
+    if (-not $svc) {
+        Add-GuiLog "ERROR: WoWWatchdog service is not installed."
+        return
+    }
+
+    try {
+        if ($svc.Status -ne 'Running') {
+            Start-Service -Name $ServiceName
+        }
+        Add-GuiLog "Service started."
+    } catch {
+        Add-GuiLog "ERROR: Failed to start service: $_"
+    }
+}
+
+function Stop-WatchdogPreferred {
+    $svc = Get-WowWatchdogService
+    if (-not $svc) { return }
+
+    try {
+        if ($svc.Status -ne 'Stopped') {
+            Stop-Service -Name $ServiceName -Force
+        }
+        Add-GuiLog "Service stopped."
+    } catch {
+        Add-GuiLog "ERROR: Failed to stop service: $_"
+    }
+}
+
 
 # Expansion + NTFY values from config
 Set-ExpansionUiFromConfig
@@ -977,9 +1089,24 @@ function Pick-File {
 # Process name aliases (WoW server variants)
 # -------------------------------------------------
 $ProcessAliases = @{
-    MySQL       = @("mysqld")
-    Authserver  = @("authserver", "bnetserver", "logonserver", "realmd", "auth")
-    Worldserver = @("worldserver")
+    MySQL = @(
+        "mysqld",
+        "mysqld-nt",
+        "mysqld-opt",
+        "mariadbd"
+    )
+
+    Authserver = @(
+        "authserver",
+        "bnetserver",
+        "logonserver",
+        "realmd",
+        "auth"
+    )
+
+    Worldserver = @(
+        "worldserver"
+    )
 }
 
 # -------------------------------------------------
@@ -1237,25 +1364,25 @@ Timestamp: $ts
 # -------------------------------------------------
 function Initialize-NtfyBaseline {
     try {
-        $global:MySqlUp     = [bool](Get-ProcessSafe "mysqld")
-        $global:AuthUp = [bool](Get-ProcessSafe "Authserver")
-        $global:WorldUp     = [bool](Get-ProcessSafe "worldserver")
-        $global:NtfyBaselineInitialized = $true
+        $global:MySqlUp  = [bool](Get-ProcessSafe "MySQL")
+        $global:AuthUp   = [bool](Get-ProcessSafe "Authserver")
+        $global:WorldUp  = [bool](Get-ProcessSafe "Worldserver")
 
-        # 2-second suppression window to avoid false "DOWN" on GUI open
+        $global:NtfyBaselineInitialized = $true
         $global:NtfySuppressUntil = (Get-Date).AddSeconds(2)
     } catch {
         $global:NtfyBaselineInitialized = $false
     }
 }
 
+
 # -------------------------------------------------
 # Polling: update LEDs + NTFY state changes
 # -------------------------------------------------
 function Update-ServiceStates {
-    $newMySql  = [bool](Get-ProcessSafe "mysqld")
-    $newAuth = [bool](Get-ProcessSafe "Authserver")
-    $newWorld  = [bool](Get-ProcessSafe "worldserver")
+    $newMySql  = [bool](Get-ProcessSafe "MySQL")
+    $newAuth   = [bool](Get-ProcessSafe "Authserver")
+    $newWorld  = [bool](Get-ProcessSafe "Worldserver")
 
     # MySQL
     if ($newMySql -ne $global:MySqlUp) {
@@ -1281,51 +1408,6 @@ function Update-ServiceStates {
     if ($global:WorldUp) { $EllipseWorld.Fill = $BrushLedGreen1 } else { $EllipseWorld.Fill = $BrushLedRed }
 }
 
-# -------------------------------------------------
-# Watchdog process control
-# -------------------------------------------------
-function Update-WatchdogStatusLabel {
-    if ($global:WatchdogPID -and (Get-Process -Id $global:WatchdogPID -ErrorAction SilentlyContinue)) {
-        $TxtWatchdogStatus.Text = "Running (PID $global:WatchdogPID)"
-        $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::LimeGreen
-    } else {
-        $TxtWatchdogStatus.Text = "Stopped"
-        $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Orange
-        $global:WatchdogPID = $null
-    }
-}
-
-function Start-Watchdog {
-    if (-not (Test-Path $WatchdogPath)) {
-        Add-GuiLog "ERROR: watchdog.ps1 not found in $ScriptDir"
-        return
-    }
-
-    if ($global:WatchdogPID -and (Get-Process -Id $global:WatchdogPID -ErrorAction SilentlyContinue)) {
-        Add-GuiLog "Watchdog is already running."
-        return
-    }
-
-    $psExe  = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $args  = "-NoProfile -ExecutionPolicy Bypass -File `"$WatchdogPath`""
-
-    try {
-        $proc = Start-Process -FilePath $psExe -ArgumentList $args -PassThru -WindowStyle Hidden
-        $global:WatchdogPID = $proc.Id
-        Add-GuiLog "Watchdog started (PID $($proc.Id))."
-    } catch {
-        Add-GuiLog "ERROR: Failed to start watchdog: $_"
-    }
-
-    Update-WatchdogStatusLabel
-}
-
-function Stop-Watchdog {
-    Add-GuiLog "Writing stop signal for watchdog..."
-    New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null
-    $global:WatchdogPID = $null
-    Update-WatchdogStatusLabel
-}
 
 # -------------------------------------------------
 # Events
@@ -1419,8 +1501,6 @@ $BtnTestNtfy.Add_Click({ Send-NTFYTest })
 # Timer – update status + log view
 # -------------------------------------------------
 Initialize-NtfyBaseline
-Update-WatchdogStatusLabel
-Update-ServiceStatusLabel
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
@@ -1429,6 +1509,7 @@ $timer.Add_Tick({
     try {
         Update-ServiceStates
         Update-WatchdogStatusLabel
+        Update-ServiceStatusLabel
 
         if (Test-Path $LogPath) {
             $text = Get-Content $LogPath -Raw -ErrorAction SilentlyContinue
@@ -1445,4 +1526,14 @@ $timer.Start()
 # -------------------------------------------------
 # Show
 # -------------------------------------------------
-$Window.ShowDialog() | Out-Null
+try {
+    $null = $Window.ShowDialog()
+}
+catch {
+    [System.Windows.MessageBox]::Show(
+        "Fatal GUI error:`n`n$($_)",
+        "WoW Watchdog",
+        'OK',
+        'Error'
+    )
+}
