@@ -1,114 +1,194 @@
-# WoW Watchdog (Windows)
-<p align="left"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> </p>
+WoW Watchdog (Windows)
+<p align="left"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
-**WoW Watchdog** is a lightweight Windows watchdog and GUI designed to keep World of Warcraft private server stacks running reliably.
+![Screen](https://github.com/user-attachments/assets/9f43b9eb-f17e-45b4-b3b2-b99599a25caf)
 
-![Screen](https://github.com/user-attachments/assets/339274bd-48c9-4d97-b12f-260e8298af90)
+WoW Watchdog is a robust Windows watchdog service and modern WPF GUI designed to reliably manage and protect World of Warcraft private server stacks.
 
-It monitors and automatically restarts common WoW services such as:
-- MySQL / MariaDB
-- Authserver (authserver, bnetserver, realmd, etc.)
-- Worldserver
+It monitors and manages common WoW services including:
 
-The system consists of:
-- A modern WPF-based GUI
-- A Windows service powered by PowerShell + NSSM
-- A heartbeat mechanism to keep GUI and service in sync
+MySQL / MariaDB
 
----
+Authserver (authserver, bnetserver, realmd, etc.)
 
-## ✨ Features
+Worldserver
 
-- 🧠 Intelligent process detection (supports common WoW variants)
-- 🔁 Automatic restarts with cooldowns
-- 🚫 Crash-loop protection for worldserver
-- 🖥️ Modern dark-themed GUI
-- 🔧 Windows service (auto-start on boot)
-- 📁 UAC-safe storage using `C:\ProgramData\WoWWatchdog`
-- ❤️ GUI ↔ service heartbeat & live status
-- 📜 Live log viewer
-- 📦 One-click installer (Inno Setup)
+The system is built around:
 
----
+A PowerShell watchdog service (managed by NSSM)
 
-## 🚀 Quick Start (Recommended)
+A modern WPF GUI (compiled via PS2EXE)
 
-### 1. Download
-Grab the latest installer from **GitHub Releases**:
+A heartbeat + status channel that keeps GUI and service fully synchronized
 
-➡️ `WoWWatchdog-Setup.exe`
+✨ Features
+Core
 
----
+🧠 Intelligent process detection (supports common WoW variants)
 
-### 2. Install
-- Run installer **as Administrator**
-- Service is installed automatically
-- Watchdog starts on boot
+🔁 Automatic restarts with configurable cooldowns
 
----
+🚫 Crash-loop protection for worldserver
 
-### 3. Configure
-Launch **WoW Watchdog** from Start Menu or Desktop shortcut.
+📁 UAC-safe storage under C:\ProgramData\WoWWatchdog
+
+🔧 Windows service (auto-start on boot)
+
+📦 One-click installer (Inno Setup + NSSM)
+
+GUI ↔ Service Integration
+
+❤️ Heartbeat-based runtime detection (no fragile service polling)
+
+📊 JSON status telemetry (watchdog.status.json)
+
+📜 Live log viewer (auto-refresh, independent scroll)
+
+🟢 Real-time LED indicators for MySQL / Auth / World
+
+Manual Control (New)
+
+▶️ Start / Stop MySQL, Authserver, and Worldserver individually
+
+🔼 Ordered startup: Database → Auth → World
+
+🔽 Graceful shutdown with configurable delays
+
+🔐 Safe coexistence with watchdog auto-restart logic
+
+Notifications
+
+🔔 NTFY integration
+
+🎯 Per-service enable/disable
+
+🚦 Priority overrides
+
+📤 Send on UP / DOWN events
+
+🧪 Test notification button in GUI
+
+Reliability Improvements
+
+🧾 Config reload without restart
+
+🧠 State-change logging (prevents log spam)
+
+🛑 Graceful watchdog shutdown via GUI
+
+🪪 Service-safe PowerShell (no console, no UI dependencies)
+
+🚀 Quick Start (Recommended)
+1. Download
+
+Grab the latest installer from GitHub Releases:
+
+➡️ WoWWatchdog-Setup.exe
+
+2. Install
+
+Run installer as Administrator
+
+The Windows service is installed automatically
+
+Watchdog is configured to start on boot
+
+3. Configure
+
+Launch WoW Watchdog from the Start Menu or Desktop shortcut.
 
 Set:
-- MySQL start script (batch file)
-- Authserver executable
-- Worldserver executable
 
-Configuration is saved to: C:\ProgramData\WoWWatchdog\config.json
+MySQL start script (.bat)
 
-### 4. Done
-That’s it.  
-The watchdog will now keep your server stack alive.
+Authserver executable
 
----
+Worldserver executable
 
-## 🛠️ Supported Processes
+Configuration is stored at:
 
-### Database
-- `mysqld`
-- `mysqld-nt`
-- `mysqld-opt`
-- `mariadbd`
+C:\ProgramData\WoWWatchdog\config.json
 
-### Auth
-- `authserver`
-- `bnetserver`
-- `realmd`
-- `logonserver`
-- `auth`
 
-### World
-- `worldserver`
+Changes are picked up automatically — no service restart required.
 
----
+4. Use
 
-## ⚙️ Advanced Notes
+Let the watchdog manage everything automatically
+or
 
-- Service runs as **LocalSystem**
-- Uses **NSSM** for reliability
-- GUI communicates via heartbeat + JSON status
-- Log spam is prevented via state-change detection
-- Safe to run on Windows 10 / 11
+Use the GUI buttons to start/stop services manually
+or
 
----
+Combine both — the watchdog respects manual actions
 
-## 📦 Building From Source
+🛠️ Supported Process Detection
+Database
 
-### Requirements
-- PowerShell 5.1+
-- PS2EXE (for GUI build)
-- NSSM
-- Inno Setup
+mysqld
 
-### Steps
-1. Compile GUI with PS2EXE
-2. Bundle `watchdog.ps1`, `nssm.exe`
-3. Build installer using `WoWWatchdog.iss`
+mysqld-nt
 
----
+mysqld-opt
 
-## ⚠️ Disclaimer
+mariadbd
 
-This project is **not affiliated with Blizzard Entertainment**.  
+Auth
+
+authserver
+
+bnetserver
+
+realmd
+
+logonserver
+
+auth
+
+World
+
+worldserver
+
+⚙️ Architecture Notes
+
+Watchdog runs as LocalSystem
+
+Managed by NSSM for crash recovery
+
+GUI ↔ service sync via:
+
+watchdog.heartbeat
+
+watchdog.status.json
+
+Logging is state-aware to prevent spam
+
+Designed for long-running uptime scenarios
+
+📦 Building From Source
+Requirements
+
+PowerShell 5.1+
+
+PS2EXE (GUI compilation)
+
+NSSM
+
+Inno Setup
+
+High-Level Build Flow
+
+Compile GUI using PS2EXE
+
+Bundle:
+
+watchdog.ps1
+
+nssm.exe
+
+Build installer using WoWWatchdog.iss
+
+⚠️ Disclaimer
+
+This project is not affiliated with Blizzard Entertainment.
 It is intended for educational, development, and private server environments only.
