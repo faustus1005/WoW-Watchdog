@@ -3,7 +3,7 @@
 
 **WoW Watchdog** is a lightweight Windows watchdog and GUI designed to keep World of Warcraft private server stacks running reliably.
 
-<p align="left"> <img src=""/> </p>
+
 
 It monitors and automatically restarts common WoW services such as:
 - MySQL / MariaDB
@@ -60,30 +60,6 @@ Configuration is saved to: C:\ProgramData\WoWWatchdog\config.json
 ### 4. Done
 That’s it.  
 The watchdog will now keep your server stack alive.
-
----
-
-## 🧩 Architecture Overview
-┌─────────────┐
-│ GUI EXE     │
-│             │
-│ Reads:      │
-│ - heartbeat │◄─┐
-│ - status    │  │
-└─────▲───────┘  │
-│                │
-│ writes stop    │
-┌─────┴───────┐  │
-│ Watchdog    │  │
-│ Service     │─-┘
-│ (PowerShell)│
-│             │
-│ Restarts:   │
-│ MySQL       │
-│ Authserver  │
-│ Worldserver │
-└─────────────┘
-
 
 ---
 
