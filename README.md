@@ -3,7 +3,7 @@
 
 **WoW Watchdog** is a lightweight Windows watchdog and GUI designed to keep World of Warcraft private server stacks running reliably.
 
-
+![Screen](https://github.com/user-attachments/assets/339274bd-48c9-4d97-b12f-260e8298af90)
 
 It monitors and automatically restarts common WoW services such as:
 - MySQL / MariaDB
