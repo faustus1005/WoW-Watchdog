@@ -112,9 +112,3 @@ The watchdog will now keep your server stack alive.
 
 This project is **not affiliated with Blizzard Entertainment**.  
 It is intended for educational, development, and private server environments only.
-
----
-
-## 📄 License
-
-MIT License
