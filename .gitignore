@@ -1,0 +1,19 @@
+# Logs
+*.log
+
+# Runtime state
+*.heartbeat
+*.status.json
+stop_watchdog.txt
+config.json
+
+# Build output
+/build/*.exe
+/build/*.zip
+
+# PS2EXE temp
+*.exe.config
+
+# OS
+Thumbs.db
+.DS_Store
