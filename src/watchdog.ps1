@@ -5,7 +5,8 @@ param(
     [int]$WorldserverBurst = 300,  # seconds
     [int]$MaxRestarts      = 100,  # max restarts within burst window
     [int]$ConfigRetrySec   = 10,   # if config invalid/missing, re-check every N seconds
-    [int]$HeartbeatEverySec = 1    # heartbeat update cadence
+    [int]$HeartbeatEverySec = 1,    # heartbeat update cadence
+    [int]$ShutdownDelaySec = 8  # delay between service stops
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,18 @@ $StopSignalFile  = Join-Path $DataDir "stop_watchdog.txt"
 $ConfigPath      = Join-Path $DataDir "config.json"
 $HeartbeatFile   = Join-Path $DataDir "watchdog.heartbeat"      # GUI checks timestamp freshness
 $StatusFile      = Join-Path $DataDir "watchdog.status.json"    # GUI reads richer status (optional)
+
+$CommandDir = $DataDir
+
+$CommandFiles = @{
+    StartMySQL      = Join-Path $CommandDir "command.start.mysql"
+    StopMySQL       = Join-Path $CommandDir "command.stop.mysql"
+    StartAuthserver = Join-Path $CommandDir "command.start.auth"
+    StopAuthserver  = Join-Path $CommandDir "command.stop.auth"
+    StartWorld      = Join-Path $CommandDir "command.start.world"
+    StopWorld       = Join-Path $CommandDir "command.stop.world"
+}
+
 
 # Log only on config-state changes (prevents spam)
 $global:LastConfigValidity = $null   # $true=valid, $false=invalid, $null=unknown
@@ -195,6 +208,71 @@ function Start-Target {
 }
 
 # -------------------------------
+# Stop a service/role.
+# -------------------------------
+function Stop-Role {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("MySQL","Authserver","Worldserver")]
+        [string]$Role
+    )
+
+    foreach ($p in $ProcessAliases[$Role]) {
+        try {
+            Get-Process -Name $p -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
+
+    Log "$Role stop requested."
+}
+
+# -------------------------------
+# Stop all roles gracefully
+# -------------------------------
+function Stop-All-Gracefully {
+    param([int]$DelaySec = 5)
+
+    Log "Graceful shutdown initiated."
+
+    Stop-Role -Role "Worldserver"
+    Start-Sleep -Seconds $DelaySec
+
+    Stop-Role -Role "Authserver"
+    Start-Sleep -Seconds $DelaySec
+
+    Stop-Role -Role "MySQL"
+
+    Log "Graceful shutdown completed."
+}
+
+
+# -------------------------------
+# Ensure proper startup. DB->Auth->World
+# -------------------------------
+function Wait-ForRole {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("MySQL","Authserver","Worldserver")]
+        [string]$Role,
+
+        [int]$TimeoutSec = 120
+    )
+
+    $start = Get-Date
+    while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
+        if (Test-ProcessRoleRunning -Role $Role) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    Log "Timeout waiting for $Role to become ready."
+    return $false
+}
+
+
+# -------------------------------
 # Ensure functions
 # -------------------------------
 function Ensure-Role {
@@ -255,6 +333,63 @@ $cfg = $null
 $pathsOk = $false
 $issuesLast = @()
 
+# -------------------------------
+# Process start commands
+# -------------------------------
+function Process-Commands {
+    param($Cfg)
+
+    # --- START commands (ordered) ---
+    if (Test-Path $CommandFiles.StartMySQL) {
+        Remove-Item $CommandFiles.StartMySQL -Force
+        Start-Target -Role "MySQL" -Path $Cfg.MySQL
+    }
+
+    if (Test-Path $CommandFiles.StartAuthserver) {
+        Remove-Item $CommandFiles.StartAuthserver -Force
+
+        if (Wait-ForRole -Role "MySQL") {
+            Start-Target -Role "Authserver" -Path $Cfg.Authserver
+        } else {
+            Log "Authserver start blocked: MySQL not ready."
+        }
+    }
+
+    if (Test-Path $CommandFiles.StartWorld) {
+        Remove-Item $CommandFiles.StartWorld -Force
+
+        if (Wait-ForRole -Role "Authserver") {
+            Start-Target -Role "Worldserver" -Path $Cfg.Worldserver
+        } else {
+            Log "Worldserver start blocked: Authserver not ready."
+        }
+    }
+
+    # --- STOP commands ---
+    $StopAllCmd = Join-Path $CommandDir "command.stop.all"
+
+    if (Test-Path $StopAllCmd) {
+        Remove-Item $StopAllCmd -Force
+        Stop-All-Gracefully -DelaySec $ShutdownDelaySec
+    }
+
+
+    if (Test-Path $CommandFiles.StopWorld) {
+        Remove-Item $CommandFiles.StopWorld -Force
+        Stop-Role -Role "Worldserver"
+    }
+
+    if (Test-Path $CommandFiles.StopAuthserver) {
+        Remove-Item $CommandFiles.StopAuthserver -Force
+        Stop-Role -Role "Authserver"
+    }
+
+    if (Test-Path $CommandFiles.StopMySQL) {
+        Remove-Item $CommandFiles.StopMySQL -Force
+        Stop-Role -Role "MySQL"
+    }
+}
+
 
 # -------------------------------
 # Main loop
@@ -263,10 +398,14 @@ while ($true) {
     try {
         # Stop signal (GUI writes this)
         if (Test-Path $StopSignalFile) {
-            Log "Stop signal detected ($StopSignalFile). Shutting down watchdog."
+            Log "Stop signal detected ($StopSignalFile). Initiating graceful shutdown."
             Remove-Item $StopSignalFile -Force -ErrorAction SilentlyContinue
+
+            Stop-All-Gracefully -DelaySec $ShutdownDelaySec
+
             Write-Heartbeat -State "Stopping" -Extra @{ reason = "StopSignal" }
             break
+
         }
 
         # Reload config periodically or if not loaded
@@ -313,10 +452,19 @@ if ($issues.Count -gt 0) {
             }
         }
 
+        Process-Commands -Cfg $cfg
+
         # Ensure roles
-        Ensure-Role -Role "MySQL"      -Path ([string]$cfg.MySQL)
-        Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver)
-        Ensure-Role -Role "Worldserver"-Path ([string]$cfg.Worldserver)
+        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL)
+
+if (Test-ProcessRoleRunning -Role "MySQL") {
+    Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver)
+}
+
+if (Test-ProcessRoleRunning -Role "Authserver") {
+    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver)
+}
+
 
         # Heartbeat + lightweight telemetry for GUI
         $extra = @{

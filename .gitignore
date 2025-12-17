@@ -5,11 +5,6 @@
 *.heartbeat
 *.status.json
 stop_watchdog.txt
-config.json
-
-# Build output
-/build/*.exe
-/build/*.zip
 
 # PS2EXE temp
 *.exe.config

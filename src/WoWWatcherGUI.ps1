@@ -249,6 +249,47 @@ $xaml = @"
     <Setter Property="Padding" Value="6,3"/>
   </Style>
 
+  <!-- ===============================
+     Button Styles
+     =============================== -->
+
+<!-- Primary action (blue) -->
+<Style x:Key="BtnPrimary" TargetType="Button">
+  <Setter Property="Background" Value="#FF3478BF"/>
+  <Setter Property="Foreground" Value="White"/>
+  <Setter Property="BorderBrush" Value="#FF2B5E9A"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="Padding" Value="10,4"/>
+</Style>
+
+<!-- Start / positive (green) -->
+<Style x:Key="BtnStart" TargetType="Button">
+  <Setter Property="Background" Value="#FF2D7A3A"/>
+  <Setter Property="Foreground" Value="White"/>
+  <Setter Property="BorderBrush" Value="#FF1E5A2B"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="Padding" Value="10,4"/>
+</Style>
+
+<!-- Stop / destructive (red) -->
+<Style x:Key="BtnStop" TargetType="Button">
+  <Setter Property="Background" Value="#FF7A3A3A"/>
+  <Setter Property="Foreground" Value="White"/>
+  <Setter Property="BorderBrush" Value="#FF5A2626"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="Padding" Value="10,4"/>
+</Style>
+
+<!-- Neutral / secondary (dark blue-gray) -->
+<Style x:Key="BtnSecondary" TargetType="Button">
+  <Setter Property="Background" Value="#FF1B2A42"/>
+  <Setter Property="Foreground" Value="White"/>
+  <Setter Property="BorderBrush" Value="#FF2B3E5E"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="Padding" Value="10,4"/>
+</Style>
+
+
   <!-- Unified ComboBox Style -->
   <Style TargetType="ComboBox">
   <Setter Property="Foreground" Value="White"/>
@@ -420,10 +461,12 @@ $xaml = @"
 
               <Grid Margin="10">
                 <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/> <!-- MySQL -->
+                    <RowDefinition Height="Auto"/> <!-- Auth -->
+                    <RowDefinition Height="Auto"/> <!-- World -->
+                    <RowDefinition Height="Auto"/> <!-- Save / Watchdog -->
+                    <RowDefinition Height="Auto"/> <!-- Per-service buttons -->
+                    <RowDefinition Height="Auto"/> <!-- Start/Stop All -->
                 </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="Auto"/>
@@ -456,6 +499,64 @@ $xaml = @"
                           Background="#FF2D7A3A" Foreground="White" Margin="0,0,10,0"/>
                   <Button x:Name="BtnStopWatchdog" Content="Stop Watchdog" MinWidth="140"
                           Background="#FF7A3A3A" Foreground="White" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="4"
+                            Grid.Column="0"
+                            Grid.ColumnSpan="3"
+                            Orientation="Horizontal"
+                            Margin="0,8,0,0">
+ <Button x:Name="BtnStartMySQL"
+          Content="Start DB"
+          Width="90"
+          Margin="0,0,6,0"
+          Style="{StaticResource BtnStart}"/>
+
+  <Button x:Name="BtnStopMySQL"
+          Content="Stop DB"
+          Width="90"
+          Margin="0,0,12,0"
+          Style="{StaticResource BtnStop}"/>
+
+  <Button x:Name="BtnStartAuth"
+          Content="Start Auth"
+          Width="90"
+          Margin="0,0,6,0"
+          Style="{StaticResource BtnStart}"/>
+
+  <Button x:Name="BtnStopAuth"
+          Content="Stop Auth"
+          Width="90"
+          Margin="0,0,12,0"
+          Style="{StaticResource BtnStop}"/>
+
+  <Button x:Name="BtnStartWorld"
+          Content="Start World"
+          Width="100"
+          Margin="0,0,6,0"
+          Style="{StaticResource BtnStart}"/>
+
+  <Button x:Name="BtnStopWorld"
+          Content="Stop World"
+          Width="100"
+          Style="{StaticResource BtnStop}"/>
+                </StackPanel>
+
+                <StackPanel Grid.Row="5"
+                            Grid.Column="0"
+                            Grid.ColumnSpan="3"
+                            Orientation="Horizontal"
+                            Margin="0,8,0,0">
+<Button x:Name="BtnStartAll"
+          Content="Start All (Ordered)"
+          Width="180"
+          Margin="0,0,10,0"
+          Style="{StaticResource BtnStart}"/>
+
+  <Button x:Name="BtnStopAll"
+          Content="Stop All (Graceful)"
+          Width="180"
+          Style="{StaticResource BtnStop}"/>
                 </StackPanel>
               </Grid>
             </GroupBox>
@@ -855,6 +956,16 @@ $ChkNtfyOnDown         = $Window.FindName("ChkNtfyOnDown")
 $ChkNtfyOnUp           = $Window.FindName("ChkNtfyOnUp")
 $BtnTestNtfy           = $Window.FindName("BtnTestNtfy")
 
+$BtnStartMySQL  = $Window.FindName("BtnStartMySQL")
+$BtnStopMySQL   = $Window.FindName("BtnStopMySQL")
+$BtnStartAuth   = $Window.FindName("BtnStartAuth")
+$BtnStopAuth    = $Window.FindName("BtnStopAuth")
+$BtnStartWorld  = $Window.FindName("BtnStartWorld")
+$BtnStopWorld   = $Window.FindName("BtnStopWorld")
+$BtnStartAll    = $Window.FindName("BtnStartAll")
+$BtnStopAll     = $Window.FindName("BtnStopAll")
+
+
 # Initial values from config
 $TxtMySQL.Text  = $Config.MySQL
 $TxtAuth.Text   = $Config.Authserver
@@ -1071,6 +1182,17 @@ function Add-GuiLog {
         $TxtLiveLog.AppendText("[$ts] $Message`r`n")
         $TxtLiveLog.ScrollToEnd()
     })
+}
+
+# -------------------------------------------------
+# Watchdog Command helper
+# -------------------------------------------------
+function Send-WatchdogCommand {
+    param([string]$Name)
+
+    $cmd = Join-Path $env:ProgramData "WoWWatchdog\$Name"
+    New-Item -Path $cmd -ItemType File -Force | Out-Null
+    Add-GuiLog "Command sent: $Name"
 }
 
 # -------------------------------------------------
@@ -1412,6 +1534,24 @@ function Update-ServiceStates {
 # -------------------------------------------------
 # Events
 # -------------------------------------------------
+$BtnStartMySQL.Add_Click({ Send-WatchdogCommand "command.start.mysql" })
+$BtnStopMySQL.Add_Click({ Send-WatchdogCommand "command.stop.mysql" })
+
+$BtnStartAuth.Add_Click({ Send-WatchdogCommand "command.start.auth" })
+$BtnStopAuth.Add_Click({ Send-WatchdogCommand "command.stop.auth" })
+
+$BtnStartWorld.Add_Click({ Send-WatchdogCommand "command.start.world" })
+$BtnStopWorld.Add_Click({ Send-WatchdogCommand "command.stop.world" })
+
+$BtnStartAll.Add_Click({
+    Send-WatchdogCommand "command.start.mysql"
+    Send-WatchdogCommand "command.start.auth"
+    Send-WatchdogCommand "command.start.world"
+})
+
+$BtnStopAll.Add_Click({ Send-WatchdogCommand "command.stop.all" })
+
+
 $BtnMinimize.Add_Click({ $Window.WindowState = 'Minimized' })
 $BtnClose.Add_Click({ $Window.Close() })
 

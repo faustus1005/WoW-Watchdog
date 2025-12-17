@@ -4,7 +4,7 @@
  
 [Setup]
 AppName=WoW Watchdog
-AppVersion=1.0.5
+AppVersion=1.1.0
 AppPublisher=WoW Watchdog Project
 DefaultDirName={commonpf32}\WoWWatchdog
 DefaultGroupName=WoW Watchdog
