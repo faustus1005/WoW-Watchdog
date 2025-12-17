@@ -1,7 +1,7 @@
 ; --------------------------------------------------
 ; WoW Watchdog Installer (EXE-based GUI)
 ; --------------------------------------------------
-
+ 
 [Setup]
 AppName=WoW Watchdog
 AppVersion=1.0.5
