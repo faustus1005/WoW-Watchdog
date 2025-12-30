@@ -45,6 +45,19 @@ $CommandFiles = @{
     StopWorld       = Join-Path $CommandDir "command.stop.world"
 }
 
+$HoldDir = Join-Path $DataDir "holds"
+if (-not (Test-Path $HoldDir)) { New-Item -ItemType Directory -Path $HoldDir -Force | Out-Null }
+
+function Get-HoldFile {
+    param([Parameter(Mandatory)][ValidateSet("MySQL","Authserver","Worldserver")][string]$Role)
+    Join-Path $HoldDir "$Role.hold"
+}
+
+function Is-RoleHeld {
+    param([Parameter(Mandatory)][ValidateSet("MySQL","Authserver","Worldserver")][string]$Role)
+    return (Test-Path (Get-HoldFile -Role $Role))
+}
+
 
 # Log only on config-state changes (prevents spam)
 $global:LastConfigValidity = $null   # $true=valid, $false=invalid, $null=unknown
@@ -133,30 +146,28 @@ $WorldBurstStart   = $null
 # Config loading + validation
 # -------------------------------
 function Load-ConfigSafe {
-if (-not (Test-Path $ConfigPath)) {
-    if ($global:LastConfigLoadState -ne "MissingConfig") {
-        Log "config.json missing at $ConfigPath. Watchdog idle (will retry)."
-        $global:LastConfigLoadState = "MissingConfig"
+    if (-not (Test-Path $ConfigPath)) {
+        if ($global:LastConfigLoadState -ne "MissingConfig") {
+            Log "config.json missing at $ConfigPath. Watchdog idle (will retry)."
+            $global:LastConfigLoadState = "MissingConfig"
+        }
+        Write-Heartbeat -State "Idle" -Extra @{ reason = "MissingConfig"; configPath = $ConfigPath }
+        return $null
     }
-
-    Write-Heartbeat -State "Idle" -Extra @{ reason = "MissingConfig"; configPath = $ConfigPath }
-    return $null
-}
 
     try {
         $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
         $global:LastConfigLoadState = ""
         return $cfg
-
-} catch {
-    if ($global:LastConfigLoadState -ne "InvalidConfig") {
-        Log "config.json invalid/unparseable. Watchdog idle (will retry). Error: $($_)"
-        $global:LastConfigLoadState = "InvalidConfig"
     }
-
-    Write-Heartbeat -State "Idle" -Extra @{ reason = "InvalidConfig"; configPath = $ConfigPath }
-    return $null
-}
+    catch {
+        if ($global:LastConfigLoadState -ne "InvalidConfig") {
+            Log "config.json invalid/unparseable. Watchdog idle (will retry). Error: $($_)"
+            $global:LastConfigLoadState = "InvalidConfig"
+        }
+        Write-Heartbeat -State "Idle" -Extra @{ reason = "InvalidConfig"; configPath = $ConfigPath }
+        return $null
+    }
 }
 
 function Test-ConfigPaths {
@@ -284,6 +295,11 @@ function Ensure-Role {
         [Parameter(Mandatory)]
         [string]$Path
     )
+
+    # Manual hold (GUI-requested stop) — do not restart
+    if (Is-RoleHeld -Role $Role) {
+        return
+    }
 
     if (Test-ProcessRoleRunning -Role $Role) { return }
 
@@ -467,15 +483,18 @@ if (Test-ProcessRoleRunning -Role "Authserver") {
 
 
         # Heartbeat + lightweight telemetry for GUI
-        $extra = @{
-            mysqlRunning      = (Test-ProcessRoleRunning -Role "MySQL")
-            authRunning       = (Test-ProcessRoleRunning -Role "Authserver")
-            worldRunning      = (Test-ProcessRoleRunning -Role "Worldserver")
-            worldBurstStart   = if ($WorldBurstStart) { $WorldBurstStart.ToString("o") } else { $null }
-            worldRestartCount = $WorldRestartCount
-            lastIssues        = $issuesLast
-        }
-        Write-Heartbeat -State "Running" -Extra $extra
+            $extra = @{
+                mysqlRunning = (Test-ProcessRoleRunning -Role "MySQL")
+                authRunning  = (Test-ProcessRoleRunning -Role "Authserver")
+                worldRunning = (Test-ProcessRoleRunning -Role "Worldserver")
+                mysqlHeld    = (Is-RoleHeld -Role "MySQL")
+                authHeld     = (Is-RoleHeld -Role "Authserver")
+                worldHeld    = (Is-RoleHeld -Role "Worldserver")
+                worldBurstStart   = if ($WorldBurstStart) { $WorldBurstStart.ToString("o") } else { $null }
+                worldRestartCount = $WorldRestartCount
+                lastIssues        = $issuesLast
+            }
+            Write-Heartbeat -State "Running" -Extra $extra
 
         Start-Sleep -Seconds $HeartbeatEverySec
     }
