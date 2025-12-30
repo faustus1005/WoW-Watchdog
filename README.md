@@ -1,14 +1,10 @@
-# 🛡️ WoW-Watchdog
+# <p align="center">🛡️ WoW-Watchdog</p>
 
-[![GitHub stars](https://img.shields.io/github/stars/faustus1005/WoW-Watchdog?style=for-the-badge)](https://github.com/faustus1005/WoW-Watchdog/stargazers)
+<p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
-[![GitHub forks](https://img.shields.io/github/forks/faustus1005/WoW-Watchdog?style=for-the-badge)](https://github.com/faustus1005/WoW-Watchdog/network)
+<p align="center">Your ultimate companion for monitoring World of Warcraft private servers.</p>
 
-[![GitHub issues](https://img.shields.io/github/issues/faustus1005/WoW-Watchdog?style=for-the-badge)](https://github.com/faustus1005/WoW-Watchdog/issues)
-
-[![GitHub license](https://img.shields.io/github/license/faustus1005/WoW-Watchdog?style=for-the-badge)](LICENSE)
-
-**Your ultimate companion for monitoring World of Warcraft private servers.**
+![screen](https://github.com/user-attachments/assets/8ba946d7-6049-4b94-9b6b-d1a2398dbd43)
 
 ## 📖 Overview
 
