@@ -48,15 +48,15 @@ This tool runs quietly in the background, periodically checking specified server
 
 ### Installation
 
-1.  **Download the latest release**
+1.  **Download the [Latest Release](https://github.com/faustus1005/WoW-Watchdog/releases/latest)**
     
     ```bash
-    https://github.com/faustus1005/WoW-Watchdog/releases/latest
+    
     Run the installer as you would any for any Windows application. Admin rights required to install the Service.
     
     ```
     
-2.  **Configure the Watchdog Server Paths**
+3.  **Configure the Watchdog Server Paths**
     
     ```bash
     1. Once the install is complete, the service starts automatically. Open the new "Wow Watchdog" icon on your desktop.
@@ -65,7 +65,7 @@ This tool runs quietly in the background, periodically checking specified server
     
     ```
     
-3.  **Optional: Configure NTFY Notifications**
+4.  **Optional: Configure NTFY Notifications**
     
     ```bash
     1. Select your expansion from the drop down, or, select custom and fill out the box that appears to the right. This is
