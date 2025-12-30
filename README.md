@@ -56,6 +56,7 @@ This tool runs quietly in the background, periodically checking specified server
     
     ```bash
     1. Once the install is complete, the service starts automatically. Open the new "Wow Watchdog" icon on your desktop.
+
     2. Ensure you select your services by clicking the Browse buttons in the top-right corner of the GUI. This lets the
         watchdog know how to start/monitor your services.
     
@@ -66,12 +67,14 @@ This tool runs quietly in the background, periodically checking specified server
     ```bash
     1. Select your expansion from the drop down, or, select custom and fill out the box that appears to the right. This is
         purely used for notification purposes and does not effect your monitoring.
+
     2. Fill out the NTFY Server information and change the topic/tags as required for your system.
+
     3. If you are using basic auth, fill in the Username and Password fields. If you aren't using basic auth, leave these blank.
         Token auth is not yet supported, but expected in the next release.
     
     ```
-    
+NOTE: Currently, the password for NTFY is stored in plain text in the json configuration file. This will be changed to rely on DPAPI in the next release.    
 
 ## 📁 Project Source Structure
 
