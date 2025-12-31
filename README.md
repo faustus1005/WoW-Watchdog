@@ -70,11 +70,11 @@ This tool runs quietly in the background, periodically checking specified server
 
     2. Fill out the NTFY Server information and change the topic/tags as required for your system.
 
-    3. If you are using basic auth, fill in the Username and Password fields. If you aren't using basic auth, leave these blank.
-        Token auth is not yet supported, but expected in the next release.
-    
+    3. Select your auth mode if you are using basic auth or token auth. If you are using basic auth, fill in the Username and Password fields.
+       for token auth, copy your token into the Token field.
+    4. Save config with the button at the top. This will ensure your settings are saved for the next re-load.
+        
     ```
-NOTE: Currently, the password for NTFY is stored in plain text in the json configuration file. This will be changed to rely on DPAPI in the next release.    
 
 ## 📁 Project Source Structure
 
