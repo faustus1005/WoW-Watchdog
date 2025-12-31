@@ -26,7 +26,7 @@ Bug Fixes:
 - Some logs weren't properly logged to the log file, causing them to briefly flash in the console and then disppear
   on the update ticket.
 
-v1.1.6 – Minor release
+## v1.1.6 – Minor release
 Feature Improvements:
 - NTFY now supports token authentication in addition to basic auth.
   - Auth Mode is now selected by drop down. Username/Password/Token fields are hidden until the mode is chosen.
