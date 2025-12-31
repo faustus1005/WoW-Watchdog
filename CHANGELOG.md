@@ -25,3 +25,12 @@ Bug Fixes:
   the service via the button or Windows Services panel should now result in a graceful shutdown of the services.
 - Some logs weren't properly logged to the log file, causing them to briefly flash in the console and then disppear
   on the update ticket.
+
+v1.1.5 – Bug fix, logic, and feature realse
+Feature Improvements:
+- NTFY now supports token authentication in addition to basic auth.
+  - Auth Mode is now selected by drop down. Username/Password/Token fields are hidden until the mode is chosen.
+- Sensitive data is now stored encrypted in secrets.json, this includes Password/Token current for NTFY
+  At reload of the app, there is no need to fill in the Password/Token fields, though they may display as empty
+  the secret is automatically pulled and used from secrets.json.
+- Starting window height increased, as it was too short to accomodate all the recent additions
