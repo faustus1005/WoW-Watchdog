@@ -1,37 +1,27 @@
-```json
-{
-  "ServerName": "Darken Worlds",
-  "Expansion": "Legion",
-
-  "MySQL": "C:\\WoWSrv\\Database\\start_mysql.bat",
-  "Authserver": "C:\\WoWSrv\\Servers\\bnetserver.exe",
-  "Worldserver": "C:\\WoWSrv\\Servers\\worldserver.exe",
-
-  "NTFY": {
-    "Server": "https://ntfy.example.com",
-    "Topic": "wow-watchdog",
-    "Tags": "wow,watchdog",
-    "PriorityDefault": 4,
-
-    "EnableMySQL": true,
-    "EnableAuthserver": true,
-    "EnableWorldserver": true,
-
-    "ServicePriorities": {
-      "MySQL": "Auto",
-      "Authserver": "Auto",
-      "Worldserver": "Auto"
-    },
-
-    "SendOnDown": true,
-    "SendOnUp": false
-  }
+﻿{
+    "ServerName":  "",
+    "Expansion":  "Unknown",
+    "MySQL":  "",
+    "Authserver":  "",
+    "Worldserver":  "",
+    "NTFY":  {
+                 "Server":  "https://ntfy.sh",
+                 "Topic": "wow-watchdog",
+                 "Tags": "wow,watchdog",
+                 "PriorityDefault": 4,
+                 "Username": "",
+                 "Password": "",
+				 "AuthMode": "None",
+                 "Token": "",
+                 "EnableMySQL":  true,
+                 "EnableAuthserver":  true,
+                 "EnableWorldserver":  true,
+                 "ServicePriorities":  {
+                                           "MySQL":  0,
+                                           "Authserver":  0,
+                                           "Worldserver":  0
+                                       },
+                 "SendOnDown":  true,
+                 "SendOnUp":  false
+             }
 }
-
-
-Notes
-
-Paths must be absolute
-Batch files (.bat) are supported for MySQL
-Changes are picked up automatically by the service
-No restart required

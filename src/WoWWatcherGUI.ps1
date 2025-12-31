@@ -1,51 +1,5 @@
 ﻿<# 
-    WoW Watchdog GUI (PowerShell 5.1)
-    --------------------------------
-
-    Pairs with watchdog.ps1 in the same folder.
-
-    Uses config.json:
-        {
-          "ServerName"  : "",
-          "Expansion"   : "Unknown",
-          "MySQL"       : "C:\\path\\to\\MySQL.bat",
-          "Authserver"  : "C:\\path\\to\\authserver.exe",
-          "Worldserver" : "C:\\path\\to\\worldserver.exe",
-          "NTFY"        : {
-              "Server"            : "https://ntfy.sh",
-              "Topic"             : "wow-watchdog",
-              "Tags"              : "wow,watchdog",
-              "PriorityDefault"   : 4,
-              "EnableMySQL"       : true,
-              "EnableAuthserver"  : true,
-              "EnableWorldserver" : true,
-              "ServicePriorities" : {
-                  "MySQL"       : 0,
-                  "Authserver"  : 0,
-                  "Worldserver" : 0
-              },
-              "SendOnDown"        : true,
-              "SendOnUp"          : false
-          }
-        }
-
-    GUI Features:
-      * Dark / blue themed UI, rounded outer window, drop shadow
-      * Custom title bar (no system chrome)
-      * Minimize + Close buttons in title bar
-      * Browse + save paths to config.json
-      * Start / Stop watchdog.ps1
-      * Watchdog status label (Running / Stopped)
-      * Process status LEDs (mysqld, authserver, worldserver) with soft pulse animation
-      * NTFY notifications:
-          - Server + Topic
-          - Expansion label (preset dropdown + custom)
-          - Tags + Priority (global)
-          - Per-service toggles
-          - Per-service priority overrides (Auto/1-5)
-          - Send On Down / Send On Up
-          - Includes Server/Host/IP/Expansion in alerts
-
+    WoW Watchdog GUI Script
 #>
 
 # -------------------------------------------------
@@ -118,6 +72,7 @@ if (-not (Test-Path $DataDir)) {
 $ConfigPath     = Join-Path $DataDir "config.json"
 $LogPath        = Join-Path $DataDir "watchdog.log"
 $HeartbeatFile = Join-Path $DataDir "watchdog.heartbeat"
+$StopSignalFile = Join-Path $DataDir "watchdog.stop"
 
 $ServiceName      = "WoWWatchdog"
 
@@ -129,6 +84,111 @@ $global:NtfyBaselineInitialized = $false
 $global:NtfySuppressUntil = $null
 $global:LedPulseFlip = $false
 
+# -------------------------------------------------
+# DPAPI Secrets Store (ProgramData)
+# -------------------------------------------------
+$SecretsPath = Join-Path $DataDir "secrets.json"
+
+function Get-SecretsStore {
+    if (-not (Test-Path $SecretsPath)) { return @{} }
+    try {
+        $raw = Get-Content $SecretsPath -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        $ht = @{}
+        foreach ($p in $obj.PSObject.Properties) { $ht[$p.Name] = [string]$p.Value }
+        return $ht
+    } catch {
+        return @{}
+    }
+}
+
+function Save-SecretsStore([hashtable]$Store) {
+    $Store | ConvertTo-Json -Depth 6 | Set-Content -Path $SecretsPath -Encoding UTF8
+}
+
+Add-Type -AssemblyName System.Security
+
+function Protect-Secret {
+    param([Parameter(Mandatory)][string]$Plain)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Plain)
+
+    # LocalMachine scope so a Windows Service can read it too
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect(
+        $bytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+
+    # store as base64
+    return [Convert]::ToBase64String($protected)
+}
+
+function Unprotect-Secret {
+    param([Parameter(Mandatory)][string]$Protected)
+
+    $protectedBytes = [Convert]::FromBase64String($Protected)
+
+    $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $protectedBytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Get-NtfySecretKey {
+    param([Parameter(Mandatory)][ValidateSet("BasicPassword","Token")][string]$Kind)
+
+    $server = ""
+    $topic  = ""
+    try { $server = [string]$TxtNtfyServer.Text } catch { }
+    try { $topic  = [string]$TxtNtfyTopic.Text } catch { }
+
+    $server = ($server.Trim()).TrimEnd('/')
+    $topic  = ($topic.Trim()).Trim('/')
+
+    if ([string]::IsNullOrWhiteSpace($server) -or [string]::IsNullOrWhiteSpace($topic)) {
+        return "NTFY::$Kind"
+    }
+
+    return "NTFY::$Kind::$server/$topic"
+}
+
+function Set-NtfySecret {
+    param(
+        [Parameter(Mandatory)][ValidateSet("BasicPassword","Token")][string]$Kind,
+        [Parameter(Mandatory)][string]$Plain
+    )
+    $store = Get-SecretsStore
+    $key   = Get-NtfySecretKey -Kind $Kind
+    $store[$key] = Protect-Secret -Plain $Plain
+    Save-SecretsStore -Store $store
+}
+
+function Get-NtfySecret {
+    param([Parameter(Mandatory)][ValidateSet("BasicPassword","Token")][string]$Kind)
+
+    $store = Get-SecretsStore
+    $key   = Get-NtfySecretKey -Kind $Kind
+    if (-not $store.ContainsKey($key)) { return $null }
+
+    try { Unprotect-Secret -Protected $store[$key] }
+    catch { return $null }
+}
+
+function Remove-NtfySecret {
+    param([Parameter(Mandatory)][ValidateSet("BasicPassword","Token")][string]$Kind)
+
+    $store = Get-SecretsStore
+    $key   = Get-NtfySecretKey -Kind $Kind
+    if ($store.ContainsKey($key)) {
+        [void]$store.Remove($key)
+        Save-SecretsStore -Store $store
+    }
+}
 
 # -------------------------------------------------
 # Ensure config.json exists
@@ -150,6 +210,9 @@ if (-not (Test-Path $ConfigPath)) {
             PriorityDefault   = 4
             Username          = ""
             Password          = ""
+            AuthMode          = "None"
+            Token             = ""
+
 
             # Per-service enable switches
             EnableMySQL       = $true
@@ -202,6 +265,9 @@ $defaultNtfy = [pscustomobject]@{
     PriorityDefault   = 4
     Username          = ""
     Password          = ""
+    AuthMode          = "None"
+    Token             = ""
+
 
     EnableMySQL       = $true
     EnableAuthserver  = $true
@@ -234,7 +300,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WoW Watchdog"
-        Width="920" Height="720"
+        Width="920" Height="1000"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResizeWithGrip"
         Background="Transparent"
@@ -646,10 +712,12 @@ $xaml = @"
     <RowDefinition Height="Auto"/> <!-- 1 Server -->
     <RowDefinition Height="Auto"/> <!-- 2 Topic -->
     <RowDefinition Height="Auto"/> <!-- 3 Tags -->
-    <RowDefinition Height="Auto"/> <!-- 4 Username -->
-    <RowDefinition Height="Auto"/> <!-- 5 Password -->
-    <RowDefinition Height="Auto"/> <!-- 6 Priority -->
-    <RowDefinition Height="Auto"/> <!-- 7 Services -->
+    <RowDefinition Height="Auto"/> <!-- 4 Auth Mode -->
+    <RowDefinition Height="Auto"/> <!-- 5 Username -->
+    <RowDefinition Height="Auto"/> <!-- 6 Password -->
+    <RowDefinition Height="Auto"/> <!-- 7 Token -->
+    <RowDefinition Height="Auto"/> <!-- 8 Priority -->
+    <RowDefinition Height="Auto"/> <!-- 9 Services -->
   </Grid.RowDefinitions>
 
   <Grid.ColumnDefinitions>
@@ -719,30 +787,58 @@ $xaml = @"
            Foreground="White"
            BorderBrush="#FF345A8A"/>
 
+<!-- Auth Mode -->
+<TextBlock Grid.Row="4" Grid.Column="0" Text="Auth Mode:"
+           VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+<ComboBox Grid.Row="4" Grid.Column="1"
+          x:Name="CmbNtfyAuthMode"
+          MinWidth="160"
+          Margin="4,2"
+          Background="#FF0F141F"
+          Foreground="White"
+          BorderBrush="#FF345A8A">
+  <ComboBoxItem Content="None" IsSelected="True"/>
+  <ComboBoxItem Content="Basic (User/Pass)"/>
+  <ComboBoxItem Content="Token (Bearer)"/>
+</ComboBox>
+
   <!-- Username -->
-  <TextBlock Grid.Row="4" Grid.Column="0" Text="Username:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <TextBox Grid.Row="4" Grid.Column="1"
+  <TextBlock x:Name="LblNtfyUsername" Grid.Row="5" Grid.Column="0" Text="Username:"
+             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+  <TextBox Grid.Row="5" Grid.Column="1"
            x:Name="TxtNtfyUsername"
            Margin="4,2"
            Background="#FF0F141F"
            Foreground="White"
-           BorderBrush="#FF345A8A"/>
+           BorderBrush="#FF345A8A"
+           Visibility="Collapsed"/>
 
   <!-- Password -->
-  <TextBlock Grid.Row="5" Grid.Column="0" Text="Password:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <PasswordBox Grid.Row="5" Grid.Column="1"
+  <TextBlock x:Name="LblNtfyPassword" Grid.Row="6" Grid.Column="0" Text="Password:"
+             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+  <PasswordBox Grid.Row="6" Grid.Column="1"
                x:Name="TxtNtfyPassword"
                Margin="4,2"
                Background="#FF0F141F"
                Foreground="White"
-               BorderBrush="#FF345A8A"/>
+               BorderBrush="#FF345A8A"
+               Visibility="Collapsed"/>
+
+               <!-- Token -->
+    <TextBlock x:Name="LblNtfyToken" Grid.Row="7" Grid.Column="0" Text="Token:"
+           VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+    <PasswordBox Grid.Row="7" Grid.Column="1"
+             x:Name="TxtNtfyToken"
+             Margin="4,2"
+             Background="#FF0F141F"
+             Foreground="White"
+             BorderBrush="#FF345A8A"
+             Visibility="Collapsed"/>               
 
   <!-- Default Priority -->
-  <TextBlock Grid.Row="6" Grid.Column="0" Text="Priority:"
+  <TextBlock Grid.Row="8" Grid.Column="0" Text="Priority:"
              VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <ComboBox Grid.Row="6" Grid.Column="1"
+  <ComboBox Grid.Row="8" Grid.Column="1"
             x:Name="CmbNtfyPriorityDefault"
             MinWidth="90"
             Background="#FF0F141F"
@@ -756,7 +852,7 @@ $xaml = @"
   </ComboBox>
 
   <!-- Services -->
-  <Grid Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,6,0,0">
+  <Grid Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,6,0,0">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
@@ -983,9 +1079,15 @@ $TxtExpansionCustom    = $Window.FindName("TxtExpansionCustom")
 
 $TxtNtfyServer         = $Window.FindName("TxtNtfyServer")
 $TxtNtfyTopic          = $Window.FindName("TxtNtfyTopic")
+$CmbNtfyAuthMode       = $Window.FindName("CmbNtfyAuthMode")
 $TxtNtfyTags           = $Window.FindName("TxtNtfyTags")
 $TxtNtfyUsername       = $Window.FindName("TxtNtfyUsername")
 $TxtNtfyPassword       = $Window.FindName("TxtNtfyPassword")  # PasswordBox
+$TxtNtfyToken          = $Window.FindName("TxtNtfyToken")
+$LblNtfyUsername       = $Window.FindName("LblNtfyUsername")
+$LblNtfyPassword       = $Window.FindName("LblNtfyPassword")
+$LblNtfyToken          = $Window.FindName("LblNtfyToken")
+
 $CmbNtfyPriorityDefault= $Window.FindName("CmbNtfyPriorityDefault")
 
 $ChkNtfyMySQL          = $Window.FindName("ChkNtfyMySQL")
@@ -1016,6 +1118,73 @@ $TxtAuth.Text   = $Config.Authserver
 $TxtWorld.Text  = $Config.Worldserver
 
 $TxtServiceStatus = $Window.FindName("TxtServiceStatus")
+
+function Get-SelectedComboContent {
+    param([System.Windows.Controls.ComboBox]$Combo)
+
+    $item = $Combo.SelectedItem
+    if (-not $item) { return "" }
+
+    # ComboBoxItem
+    if ($item -is [System.Windows.Controls.ComboBoxItem]) {
+        return [string]$item.Content
+    }
+
+    # Fallback: plain strings or other objects
+    return [string]$item
+}
+
+
+function Update-NtfyAuthUI {
+
+    $mode = ""
+    try {
+        $mode = [string](Get-SelectedComboContent $CmbNtfyAuthMode)
+    } catch { $mode = "" }
+
+    $mode = $mode.Trim()
+
+    switch -Wildcard ($mode) {
+
+        "Basic*" {
+            $TxtNtfyUsername.Visibility = "Visible"
+            $TxtNtfyPassword.Visibility = "Visible"
+            $TxtNtfyToken.Visibility    = "Collapsed"
+
+            # Optional (recommended): if you have label TextBlocks, toggle them too
+            if ($LblNtfyUsername) { $LblNtfyUsername.Visibility = "Visible" }
+            if ($LblNtfyPassword) { $LblNtfyPassword.Visibility = "Visible" }
+            if ($LblNtfyToken)    { $LblNtfyToken.Visibility    = "Collapsed" }
+        }
+
+        "Token*" {
+            $TxtNtfyUsername.Visibility = "Collapsed"
+            $TxtNtfyPassword.Visibility = "Collapsed"
+            $TxtNtfyToken.Visibility    = "Visible"
+
+            if ($LblNtfyUsername) { $LblNtfyUsername.Visibility = "Collapsed" }
+            if ($LblNtfyPassword) { $LblNtfyPassword.Visibility = "Collapsed" }
+            if ($LblNtfyToken)    { $LblNtfyToken.Visibility    = "Visible" }
+        }
+
+        default { # None
+            $TxtNtfyUsername.Visibility = "Collapsed"
+            $TxtNtfyPassword.Visibility = "Collapsed"
+            $TxtNtfyToken.Visibility    = "Collapsed"
+
+            if ($LblNtfyUsername) { $LblNtfyUsername.Visibility = "Collapsed" }
+            if ($LblNtfyPassword) { $LblNtfyPassword.Visibility = "Collapsed" }
+            if ($LblNtfyToken)    { $LblNtfyToken.Visibility    = "Collapsed" }
+        }
+    }
+}
+
+# Run once after you set SelectedItem from config
+Update-NtfyAuthUI
+
+# Update when changed
+$CmbNtfyAuthMode.Add_SelectionChanged({ Update-NtfyAuthUI })
+
 
 function Get-WowWatchdogService {
     try { return Get-Service -Name $ServiceName -ErrorAction Stop } catch { return $null }
@@ -1170,29 +1339,49 @@ function Stop-WatchdogPreferred {
 # Expansion + NTFY values from config
 Set-ExpansionUiFromConfig
 
-$TxtNtfyServer.Text            = $Config.NTFY.Server
-$TxtNtfyTopic.Text             = $Config.NTFY.Topic
-$TxtNtfyTags.Text              = $Config.NTFY.Tags
-$TxtNtfyUsername.Text          = $Config.NTFY.Username
-try { $TxtNtfyPassword.Password = [string]$Config.NTFY.Password } catch { }
+$TxtNtfyServer.Text   = [string]$Config.NTFY.Server
+$TxtNtfyTopic.Text    = [string]$Config.NTFY.Topic
+$TxtNtfyTags.Text     = [string]$Config.NTFY.Tags
+$TxtNtfyUsername.Text = [string]$Config.NTFY.Username
+
+# AuthMode (select matching item; backward compatible)
+$mode = "None"
+try {
+    if ($Config.NTFY -and $Config.NTFY.PSObject.Properties["AuthMode"]) {
+        $mode = [string]$Config.NTFY.AuthMode
+        if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "None" }
+    }
+} catch { $mode = "None" }
+
+[void](Select-ComboItemByContent -Combo $CmbNtfyAuthMode -Content $mode)
+
+# DPAPI mode: do NOT load secrets into UI (recommended)
+# (Send logic will pull from secrets store if boxes are empty)
+try { $TxtNtfyPassword.Password = "" } catch { }
+try { $TxtNtfyToken.Password    = "" } catch { }
+
+# Apply visibility after setting selection
+Update-NtfyAuthUI
 
 # Default priority
-$prioDefault = [int]$Config.NTFY.PriorityDefault
+$prioDefault = 4
+try { $prioDefault = [int]$Config.NTFY.PriorityDefault } catch { $prioDefault = 4 }
 if ($prioDefault -lt 1 -or $prioDefault -gt 5) { $prioDefault = 4 }
 [void](Select-ComboItemByContent -Combo $CmbNtfyPriorityDefault -Content ([string]$prioDefault))
 
 # Per-service enable switches
-$ChkNtfyMySQL.IsChecked        = [bool]$Config.NTFY.EnableMySQL
-$ChkNtfyAuthserver.IsChecked   = [bool]$Config.NTFY.EnableAuthserver
-$ChkNtfyWorldserver.IsChecked  = [bool]$Config.NTFY.EnableWorldserver
+$ChkNtfyMySQL.IsChecked       = [bool]$Config.NTFY.EnableMySQL
+$ChkNtfyAuthserver.IsChecked  = [bool]$Config.NTFY.EnableAuthserver
+$ChkNtfyWorldserver.IsChecked = [bool]$Config.NTFY.EnableWorldserver
 
 # Per-service priority overrides
 $svcPri = $Config.NTFY.ServicePriorities
 if (-not $svcPri) { $svcPri = [pscustomobject]@{} }
 
-Set-PriorityOverrideCombo -Combo $CmbPriMySQL      -Value ([int]($svcPri.MySQL))
-Set-PriorityOverrideCombo -Combo $CmbPriAuthserver -Value ([int]($svcPri.Authserver))
+Set-PriorityOverrideCombo -Combo $CmbPriMySQL       -Value ([int]($svcPri.MySQL))
+Set-PriorityOverrideCombo -Combo $CmbPriAuthserver  -Value ([int]($svcPri.Authserver))
 Set-PriorityOverrideCombo -Combo $CmbPriWorldserver -Value ([int]($svcPri.Worldserver))
+
 
 # State-change triggers
 $ChkNtfyOnDown.IsChecked       = [bool]$Config.NTFY.SendOnDown
@@ -1221,6 +1410,64 @@ $BrushLedGray   = New-Object System.Windows.Media.SolidColorBrush ([System.Windo
 $EllipseMySQL.Fill  = $BrushLedGray
 $EllipseAuth.Fill   = $BrushLedGray
 $EllipseWorld.Fill  = $BrushLedGray
+
+# -------------------------------------------------
+# NTFY auth header helper
+# -------------------------------------------------
+function Get-NtfyAuthHeaders {
+    param(
+        [string]$Mode,
+        [string]$Username,
+        [string]$Password,
+        [string]$Token
+    )
+
+    $headers = @{}
+    $m = ""
+    if ($Mode) { $m = $Mode.Trim() }
+
+    switch ($m) {
+        "None" { return $headers }
+
+        "Basic (User/Pass)" {
+            $u = ""
+            if ($Username) { $u = $Username.Trim() }
+
+            $pw = ""
+            if (-not [string]::IsNullOrWhiteSpace($Password)) {
+                $pw = $Password
+            } else {
+                $pw = Get-NtfySecret -Kind "BasicPassword"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($u) -and -not [string]::IsNullOrWhiteSpace($pw)) {
+                $pair = "{0}:{1}" -f $u, $pw
+                $b64  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+                $headers["Authorization"] = "Basic $b64"
+            }
+            return $headers
+        }
+
+        "Token (Bearer)" {
+            $tk = ""
+            if (-not [string]::IsNullOrWhiteSpace($Token)) {
+                $tk = $Token
+            } else {
+                $tk = Get-NtfySecret -Kind "Token"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($tk)) {
+                $headers["Authorization"] = "Bearer $tk"
+            }
+            return $headers
+        }
+
+        default {
+            # Unknown -> treat as None
+            return $headers
+        }
+    }
+}
 
 # -------------------------------------------------
 # GUI log helper
@@ -1508,18 +1755,28 @@ Timestamp: $ts
 "@
 
     try {
-        $headers = @{
-            "Title"    = $title
-            "Priority" = "$prio"
-            "Tags"     = $tagsHeader
-        }
+$headers = @{
+    "Title"    = $title
+    "Priority" = "$prio"
+    "Tags"     = $tagsHeader
+}
 
-        $auth = Get-NtfyAuthHeader
-        if ($auth) {
-            $headers["Authorization"] = $auth
-        }
+# Auth: None / Basic / Token
+$mode = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
 
-        Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
+$username = ""
+if ($TxtNtfyUsername -and $TxtNtfyUsername.Text) { $username = [string]$TxtNtfyUsername.Text }
+
+$password = ""
+if ($TxtNtfyPassword) { $password = [string]$TxtNtfyPassword.Password }
+
+$token = ""
+if ($TxtNtfyToken) { $token = [string]$TxtNtfyToken.Password }   # PasswordBox
+
+$authHeaders = Get-NtfyAuthHeaders -Mode $mode -Username $username -Password $password -Token $token
+foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
+
+Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
 
         Add-GuiLog "Sent NTFY notification for $ServiceName state change ($prev -> $curr)."
     } catch {
@@ -1583,18 +1840,30 @@ Timestamp: $ts
 "@
 
     try {
-        $headers = @{
-            "Title"    = $title
-            "Priority" = "$prio"
-            "Tags"     = $tags
-        }
+$headers = @{
+    "Title"    = $title
+    "Priority" = "$prio"
+    "Tags"     = $tags
+}
 
-        $auth = Get-NtfyAuthHeader
-        if ($auth) {
-            $headers["Authorization"] = $auth
-        }
+# Auth: None / Basic / Token
+$mode = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
 
-        Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
+$username = ""
+if ($TxtNtfyUsername -and $TxtNtfyUsername.Text) { $username = [string]$TxtNtfyUsername.Text }
+
+$password = ""
+if ($TxtNtfyPassword) { $password = [string]$TxtNtfyPassword.Password }
+
+$token = ""
+if ($TxtNtfyToken) { $token = [string]$TxtNtfyToken.Password }
+
+
+$authHeaders = Get-NtfyAuthHeaders -Mode $mode -Username $username -Password $password -Token $token
+foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
+
+Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
+
 
         Add-GuiLog "Sent NTFY test notification."
     } catch {
@@ -1616,21 +1885,6 @@ function Initialize-NtfyBaseline {
     } catch {
         $global:NtfyBaselineInitialized = $false
     }
-}
-#
-# Send Basic Auth header on publish
-#
-function Get-NtfyAuthHeader {
-    $u = $TxtNtfyUsername.Text.Trim()
-    $p = $TxtNtfyPassword.Password
-
-    if ([string]::IsNullOrWhiteSpace($u) -or [string]::IsNullOrWhiteSpace($p)) {
-        return $null
-    }
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$u`:$p")
-    $b64   = [Convert]::ToBase64String($bytes)
-    return "Basic $b64"
 }
 
 # -------------------------------------------------
@@ -1753,6 +2007,47 @@ $BtnSaveConfig.Add_Click({
         if ([string]::IsNullOrWhiteSpace($expVal)) { $expVal = "Custom" }
     }
 
+    # Resolve Auth Mode selection (PS 5.1-safe)
+$authMode = "None"
+try {
+    $sel = $CmbNtfyAuthMode.SelectedItem
+    if ($sel -and $sel.Content) { $authMode = [string]$sel.Content }
+} catch { }
+
+# Persist secrets (DPAPI) based on selected mode
+try {
+if ($authMode -eq "Basic (User/Pass)") {
+    $plainPw = ""
+    try { $plainPw = $TxtNtfyPassword.Password } catch { $plainPw = "" }
+
+    if ([string]::IsNullOrWhiteSpace($plainPw)) {
+        Remove-NtfySecret -Kind "BasicPassword"
+    } else {
+        Set-NtfySecret -Kind "BasicPassword" -Plain $plainPw
+    }
+
+    # optional cross-mode cleanup
+    Remove-NtfySecret -Kind "Token"
+}
+elseif ($authMode -eq "Token (Bearer)") {
+    $plainToken = ""
+    try { $plainToken = $TxtNtfyToken.Password } catch { $plainToken = "" }
+
+    if ([string]::IsNullOrWhiteSpace($plainToken)) {
+        Remove-NtfySecret -Kind "Token"
+    } else {
+        Set-NtfySecret -Kind "Token" -Plain $plainToken
+    }
+
+    Remove-NtfySecret -Kind "BasicPassword"
+}
+else {
+    # None: optional cleanup of both secrets
+    # Remove-NtfySecret -Kind "BasicPassword"
+    # Remove-NtfySecret -Kind "Token"
+}
+} catch { }
+
     # Priority parsing helpers
     function Get-ComboContentIntOrZero {
         param([System.Windows.Controls.ComboBox]$Combo)
@@ -1777,12 +2072,16 @@ $BtnSaveConfig.Add_Click({
         Authserver  = $TxtAuth.Text
         Worldserver = $TxtWorld.Text
 
-        NTFY        = [pscustomobject]@{
+        NTFY = [pscustomobject]@{
             Server            = $TxtNtfyServer.Text
             Topic             = $TxtNtfyTopic.Text
             Tags              = $TxtNtfyTags.Text
+
+            AuthMode          = $authMode
             Username          = $TxtNtfyUsername.Text
-            Password          = $TxtNtfyPassword.Password
+            Password          = ""
+            Token             = ""
+
             PriorityDefault   = $prioDefault
 
             EnableMySQL       = [bool]$ChkNtfyMySQL.IsChecked
