@@ -12,7 +12,7 @@
 - GUI ↔ service heartbeat integration
 - ProgramData-based config and logs
 - Inno Setup installer
-- 
+  
 ## v1.1.5 – Bug fix, logic, and feature realse
 Feature Additions:
 - Added basic auth for NTFY (Username and Password field, Token auth in next release)
