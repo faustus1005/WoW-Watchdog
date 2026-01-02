@@ -3,7 +3,7 @@
 #>
 
 # -------------------------------------------------
-# Self-elevate to Administrator (EXE-safe + PS1-safe)
+# Self-elevate to Administrator if not already
 # -------------------------------------------------
 function Test-IsAdmin {
     try {
@@ -53,28 +53,61 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
 # -------------------------------------------------
+# JSON helpers
+# -------------------------------------------------
+function Read-JsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+    try {
+        return ($raw | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        # If config is corrupted, return null so caller can recreate/default
+        return $null
+    }
+}
+
+function Write-JsonFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Object
+    )
+
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+
+    $Object | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+
+# -------------------------------------------------
 # Paths / constants
 # -------------------------------------------------
+# Canonical paths and globals
 # -------------------------------------------------
-# Canonical paths (ProgramData-safe)
-# -------------------------------------------------
-$AppName = "WoWWatchdog"
+$AppName     = "WoWWatchdog"
+$ExePath     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$InstallDir  = Split-Path -Parent $ExePath
+$ScriptDir   = $InstallDir
 
-$ExePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$InstallDir = Split-Path -Parent $ExePath
-$ScriptDir  = $InstallDir
-$DataDir    = Join-Path $env:ProgramData $AppName
-
+$DataDir     = Join-Path $env:ProgramData $AppName
 if (-not (Test-Path $DataDir)) {
     New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
 }
 
 $ConfigPath     = Join-Path $DataDir "config.json"
+$SecretsPath    = Join-Path $DataDir "secrets.json"
 $LogPath        = Join-Path $DataDir "watchdog.log"
-$HeartbeatFile = Join-Path $DataDir "watchdog.heartbeat"
+$HeartbeatFile  = Join-Path $DataDir "watchdog.heartbeat"
 $StopSignalFile = Join-Path $DataDir "watchdog.stop"
 
-$ServiceName      = "WoWWatchdog"
+$ServiceName    = "WoWWatchdog"
 
 # Status flags for LED + NTFY baseline
 $global:MySqlUp       = $false
@@ -83,12 +116,90 @@ $global:WorldUp       = $false
 $global:NtfyBaselineInitialized = $false
 $global:NtfySuppressUntil = $null
 $global:LedPulseFlip = $false
+$global:PlayerCountCache = [pscustomobject]@{
+    Value     = $null
+    Timestamp = [datetime]::MinValue
+}
+$global:PlayerCountCacheTtlSeconds = 5
 
 # -------------------------------------------------
-# DPAPI Secrets Store (ProgramData)
+# Default config (NON-secrets)
 # -------------------------------------------------
-$SecretsPath = Join-Path $DataDir "secrets.json"
+$DefaultConfig = [ordered]@{
+    ServerName   = ""
+    Expansion    = "Unknown"
 
+    MySQL        = ""     # e.g. C:\WoWSrv\Database\start_mysql.bat
+    MySQLExe     = ""     # e.g. C:\WoWSrv\Database\bin\mysql.exe
+    Authserver   = ""     # e.g. C:\WoWSrv\authserver.exe
+    Worldserver  = ""     # e.g. C:\WoWSrv\worldserver.exe
+
+    # DB settings (non-secrets)
+    DbHost       = "127.0.0.1"
+    DbPort       = 3306
+    DbUser       = "root"
+    DbNameChar   = "legion_characters"
+
+    # NTFY settings (non-secrets)
+    NTFY = [ordered]@{
+        Server            = ""
+        Topic             = ""
+        Tags              = "wow,watchdog"
+        PriorityDefault   = 4
+        Username          = ""
+        AuthMode          = "None"
+
+        EnableMySQL       = $true
+        EnableAuthserver  = $true
+        EnableWorldserver = $true
+
+        ServicePriorities = [ordered]@{
+            MySQL      = 0
+            Authserver = 0
+            Worldserver= 0
+        }
+
+        SendOnDown        = $true
+        SendOnUp          = $false
+    }
+}
+
+# Load/create config.json (and upgrade schema if needed)
+$Config = Read-JsonFile $ConfigPath
+if (-not $Config) {
+    Write-JsonFile -Path $ConfigPath -Object $DefaultConfig
+    $Config = Read-JsonFile $ConfigPath
+}
+
+function Ensure-ConfigSchema {
+    param([Parameter(Mandatory)]$Cfg, [Parameter(Mandatory)]$Defaults)
+
+    foreach ($p in $Defaults.PSObject.Properties) {
+        if (-not $Cfg.PSObject.Properties[$p.Name]) {
+            $Cfg | Add-Member -MemberType NoteProperty -Name $p.Name -Value $p.Value
+            continue
+        }
+
+        # Recurse into nested objects
+        $dv = $p.Value
+        $cv = $Cfg.$($p.Name)
+
+        if ($dv -is [System.Collections.IDictionary] -or $dv -is [pscustomobject]) {
+            if ($cv -is [pscustomobject]) {
+                Ensure-ConfigSchema -Cfg $cv -Defaults $dv
+            }
+        }
+    }
+}
+
+Ensure-ConfigSchema -Cfg $Config -Defaults ([pscustomobject]$DefaultConfig)
+
+# Persist upgraded config immediately
+Write-JsonFile -Path $ConfigPath -Object $Config
+
+# -------------------------------------------------
+# DPAPI Secrets Store
+# -------------------------------------------------
 function Get-SecretsStore {
     if (-not (Test-Path $SecretsPath)) { return @{} }
     try {
@@ -104,7 +215,10 @@ function Get-SecretsStore {
 }
 
 function Save-SecretsStore([hashtable]$Store) {
-    $Store | ConvertTo-Json -Depth 6 | Set-Content -Path $SecretsPath -Encoding UTF8
+    if (-not (Test-Path $DataDir)) {
+        New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
+    }
+    $Store | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $SecretsPath -Encoding UTF8
 }
 
 Add-Type -AssemblyName System.Security
@@ -190,111 +304,149 @@ function Remove-NtfySecret {
     }
 }
 
-# -------------------------------------------------
-# Ensure config.json exists
-# -------------------------------------------------
-if (-not (Test-Path $ConfigPath)) {
-    $default = [pscustomobject]@{
-        # Optional identity metadata (used for alert context)
-        ServerName  = ""
-        Expansion   = "Unknown"
+function Get-DbSecretKey {
+    # Bind the password to host/port/user so it survives GUI restarts, but allows multiple DB targets.
+    $h = ""
+    $p = ""
+    $u = ""
 
-        MySQL       = ""
-        Authserver  = ""
-        Worldserver = ""
+    try { $h = [string]$TxtDbHost.Text } catch { $h = [string]$Config.DbHost }
+    try { $p = [string]$TxtDbPort.Text } catch { $p = [string]$Config.DbPort }
+    try { $u = [string]$TxtDbUser.Text } catch { $u = [string]$Config.DbUser }
 
-        NTFY        = [pscustomobject]@{
-            Server            = ""
-            Topic             = ""
-            Tags              = "wow,watchdog"
-            PriorityDefault   = 4
-            Username          = ""
-            Password          = ""
-            AuthMode          = "None"
-            Token             = ""
+    $h = ($h.Trim())
+    if ([string]::IsNullOrWhiteSpace($h)) { $h = "127.0.0.1" }
 
+    $p = ($p.Trim())
+    if (-not $p) { $p = "3306" }
 
-            # Per-service enable switches
-            EnableMySQL       = $true
-            EnableAuthserver  = $true
-            EnableWorldserver = $true
+    $u = ($u.Trim())
+    if ([string]::IsNullOrWhiteSpace($u)) { $u = "root" }
 
-            # Per-service priority overrides (0 = Auto)
-            ServicePriorities = [pscustomobject]@{
-                MySQL       = 0
-                Authserver  = 0
-                Worldserver = 0
-            }
+    return "DB::mysql::$u@$h`:$p"
+}
 
-            # State-change triggers
-            SendOnDown        = $true
-            SendOnUp          = $false
+function Set-DbSecretPassword {
+    param([Parameter(Mandatory)][string]$Plain)
+
+    $store = Get-SecretsStore
+    $key   = Get-DbSecretKey
+    $store[$key] = Protect-Secret -Plain $Plain
+    Save-SecretsStore -Store $store
+}
+
+function Get-DbSecretPassword {
+    $store = Get-SecretsStore
+    $key   = Get-DbSecretKey
+    if (-not $store.ContainsKey($key)) { return $null }
+
+    try { return (Unprotect-Secret -Protected $store[$key]) }
+    catch { return $null }
+}
+
+function Remove-DbSecretPassword {
+    $store = Get-SecretsStore
+    $key   = Get-DbSecretKey
+    if ($store.ContainsKey($key)) {
+        [void]$store.Remove($key)
+        Save-SecretsStore -Store $store
+    }
+}
+
+function Get-OnlinePlayerCount_Legion {
+
+    # mysql.exe
+    $mysqlExePath = [string]$Config.MySQLExe
+    if ([string]::IsNullOrWhiteSpace($mysqlExePath) -or
+        -not (Test-Path -LiteralPath $mysqlExePath)) {
+        throw "mysql.exe path not set or invalid."
+    }
+
+    # DB password (DPAPI secret)
+    $dbPassword = Get-DbSecretPassword
+    if ([string]::IsNullOrWhiteSpace($dbPassword)) {
+        throw "DB password not set in secrets store."
+    }
+
+    # Host
+    $dbHostName = [string]$Config.DbHost
+    if ([string]::IsNullOrWhiteSpace($dbHostName)) {
+        $dbHostName = "127.0.0.1"
+    }
+
+    # Port
+    $dbPortNum = 3306
+    try { $dbPortNum = [int]$Config.DbPort } catch { $dbPortNum = 3306 }
+
+    # User
+    $dbUserName = [string]$Config.DbUser
+    if ([string]::IsNullOrWhiteSpace($dbUserName)) {
+        $dbUserName = "root"
+    }
+
+    # Character DB (configurable, defaulted)
+    $dbNameChars = [string]$Config.DbNameChar
+    if ([string]::IsNullOrWhiteSpace($dbNameChars)) {
+        $dbNameChars = "legion_characters"
+    }
+
+    # Query (confirmed schema)
+    $query = "SELECT COUNT(*) FROM characters WHERE online=1;"
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $mysqlExePath
+    $psi.Arguments = "--host=$dbHostName --port=$dbPortNum --user=$dbUserName --database=$dbNameChars --batch --skip-column-names -e `"$query`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow = $true
+
+    # Secure password injection (not visible in process list)
+    $psi.EnvironmentVariables["MYSQL_PWD"] = $dbPassword
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) {
+        throw "Failed to start mysql.exe"
+    }
+
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+
+    if ($proc.ExitCode -ne 0) {
+        $err = $stderr.Trim()
+        if ([string]::IsNullOrWhiteSpace($err)) {
+            $err = "Exit code $($proc.ExitCode)"
         }
-    }
-    $default | ConvertTo-Json -Depth 6 | Set-Content -Path $ConfigPath -Encoding UTF8
-}
-
-try {
-    $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-} catch {
-    $Config = [pscustomobject]@{
-        ServerName  = ""
-        Expansion   = "Unknown"
-        MySQL       = ""
-        Authserver  = ""
-        Worldserver = ""
-    }
-}
-
-# Ensure root-level metadata exists (backward compatible)
-$defaultRoot = [pscustomobject]@{
-    ServerName = ""
-    Expansion  = "Unknown"
-}
-foreach ($p in $defaultRoot.PSObject.Properties.Name) {
-    if (-not $Config.PSObject.Properties[$p]) {
-        $Config | Add-Member -Name $p -Value $defaultRoot.$p -MemberType NoteProperty
-    }
-}
-
-# Ensure NTFY object exists and has expected fields
-$defaultNtfy = [pscustomobject]@{
-    Server            = ""
-    Topic             = ""
-    Tags              = "wow,watchdog"
-    PriorityDefault   = 4
-    Username          = ""
-    Password          = ""
-    AuthMode          = "None"
-    Token             = ""
-
-
-    EnableMySQL       = $true
-    EnableAuthserver  = $true
-    EnableWorldserver = $true
-
-    ServicePriorities = [pscustomobject]@{
-        MySQL       = 0
-        Authserver  = 0
-        Worldserver = 0
+        throw "mysql.exe query failed: $err"
     }
 
-    SendOnDown        = $true
-    SendOnUp          = $false
+    $line = ($stdout.Trim() -split "\r?\n" | Select-Object -First 1).Trim()
+    $count = 0
+    if (-not [int]::TryParse($line, [ref]$count)) {
+        throw "Unexpected mysql output: '$line'"
+    }
+
+    return $count
 }
 
-if (-not $Config.PSObject.Properties['NTFY']) {
-    $Config | Add-Member -Name NTFY -Value $defaultNtfy -MemberType NoteProperty
-} else {
-    foreach ($p in $defaultNtfy.PSObject.Properties.Name) {
-        if (-not $Config.NTFY.PSObject.Properties[$p]) {
-            $Config.NTFY | Add-Member -Name $p -Value $defaultNtfy.$p -MemberType NoteProperty
-        }
+function Get-OnlinePlayerCountCached_Legion {
+    $now = Get-Date
+    $age = ($now - $global:PlayerCountCache.Timestamp).TotalSeconds
+
+    if ($null -ne $global:PlayerCountCache.Value -and $age -lt $global:PlayerCountCacheTtlSeconds) {
+        return [int]$global:PlayerCountCache.Value
     }
+
+    $val = Get-OnlinePlayerCount_Legion
+    $global:PlayerCountCache.Value = [int]$val
+    $global:PlayerCountCache.Timestamp = $now
+    return [int]$val
 }
 
 # -------------------------------------------------
-# XAML – Dark/Blue, Rounded, Custom Title Bar, Gradient Panels, NTFY block, Autoscaling
+# XAML – Dark/Blue Theme
 # -------------------------------------------------
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -431,10 +583,7 @@ $xaml = @"
   </Setter>
 </Style>
 
-
-
 </Window.Resources>
-
 
   <Border CornerRadius="14"
           Background="#FF0D111A"
@@ -503,444 +652,611 @@ $xaml = @"
           <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <ScrollViewer Grid.Row="0"
-                      VerticalScrollBarVisibility="Auto"
-                      HorizontalScrollBarVisibility="Disabled">
-          <Grid>
+<TabControl Grid.Row="0"
+            Margin="0,0,0,6"
+            Background="#FF0D111A"
+            BorderBrush="#FF2B3E5E"
+            Foreground="White"
+            Padding="4">
+
+  <!-- ================================================= -->
+  <!-- TAB 1: Main                                       -->
+  <!-- ================================================= -->
+  <TabItem Header="Main">
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/> <!-- Controls -->
+          <RowDefinition Height="Auto"/> <!-- Status -->
+        </Grid.RowDefinitions>
+
+        <!-- Controls -->
+        <GroupBox Grid.Row="0" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="Controls"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0" />
+              <GradientStop Color="#FF111623" Offset="1.0" />
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
             <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/> <!-- Watchdog buttons -->
+              <RowDefinition Height="Auto"/> <!-- Per-service buttons -->
+              <RowDefinition Height="Auto"/> <!-- Start/Stop All -->
+            </Grid.RowDefinitions>
+
+            <!-- Watchdog -->
+            <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+              <Button x:Name="BtnStartWatchdog" Content="Start Watchdog" MinWidth="160"
+                      Background="#FF2D7A3A" Foreground="White" Margin="0,0,10,0"/>
+              <Button x:Name="BtnStopWatchdog" Content="Stop Watchdog" MinWidth="160"
+                      Background="#FF7A3A3A" Foreground="White"/>
+            </StackPanel>
+
+            <!-- Per-service -->
+            <StackPanel Grid.Row="1"
+                        Orientation="Horizontal"
+                        Margin="0,0,0,8">
+              <Button x:Name="BtnStartMySQL"
+                      Content="Start DB"
+                      Width="90"
+                      Margin="0,0,6,0"
+                      Style="{StaticResource BtnStart}"/>
+
+              <Button x:Name="BtnStopMySQL"
+                      Content="Stop DB"
+                      Width="90"
+                      Margin="0,0,12,0"
+                      Style="{StaticResource BtnStop}"/>
+
+              <Button x:Name="BtnStartAuth"
+                      Content="Start Auth"
+                      Width="90"
+                      Margin="0,0,6,0"
+                      Style="{StaticResource BtnStart}"/>
+
+              <Button x:Name="BtnStopAuth"
+                      Content="Stop Auth"
+                      Width="90"
+                      Margin="0,0,12,0"
+                      Style="{StaticResource BtnStop}"/>
+
+              <Button x:Name="BtnStartWorld"
+                      Content="Start World"
+                      Width="100"
+                      Margin="0,0,6,0"
+                      Style="{StaticResource BtnStart}"/>
+
+              <Button x:Name="BtnStopWorld"
+                      Content="Stop World"
+                      Width="100"
+                      Style="{StaticResource BtnStop}"/>
+            </StackPanel>
+
+            <!-- Start/Stop All -->
+            <StackPanel Grid.Row="2"
+                        Orientation="Horizontal">
+              <Button x:Name="BtnStartAll"
+                      Content="Start All (Ordered)"
+                      Width="180"
+                      Margin="0,0,10,0"
+                      Style="{StaticResource BtnStart}"/>
+
+              <Button x:Name="BtnStopAll"
+                      Content="Stop All (Graceful)"
+                      Width="180"
+                      Style="{StaticResource BtnStop}"/>
+            </StackPanel>
+
+          </Grid>
+        </GroupBox>
+
+        <!-- Status -->
+        <GroupBox Grid.Row="1" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="Status"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0" />
+              <GradientStop Color="#FF111623" Offset="1.0" />
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/> <!-- Watchdog -->
+              <RowDefinition Height="Auto"/> <!-- Service -->
+              <RowDefinition Height="Auto"/> <!-- LEDs -->
+              <RowDefinition Height="Auto"/> <!-- Online players -->
+            </Grid.RowDefinitions>
+
+            <WrapPanel Grid.Row="0" Margin="0,0,0,6">
+              <TextBlock Text="Watchdog:" Foreground="White" Margin="0,0,6,0"/>
+              <TextBlock x:Name="TxtWatchdogStatus"
+                         Text="Stopped"
+                         Foreground="Orange"
+                         FontWeight="Bold"/>
+            </WrapPanel>
+
+            <WrapPanel Grid.Row="1" Margin="0,0,0,8">
+              <TextBlock Text="Service:"
+                         Foreground="#FF86B5E5"
+                         Margin="0,0,6,0"/>
+              <TextBlock x:Name="TxtServiceStatus"
+                         Text="Not installed"
+                         Foreground="#FFFFB347"
+                         FontWeight="SemiBold"/>
+            </WrapPanel>
+
+            <WrapPanel Grid.Row="2" Margin="0,0,0,8">
+              <StackPanel Orientation="Horizontal" Margin="0,0,18,0">
+                <Ellipse x:Name="EllipseMySQL" Width="14" Height="14" Margin="0,0,6,0"/>
+                <TextBlock Text="MySQL" Foreground="White" VerticalAlignment="Center"/>
+              </StackPanel>
+
+              <StackPanel Orientation="Horizontal" Margin="0,0,18,0">
+                <Ellipse x:Name="EllipseAuth" Width="14" Height="14" Margin="0,0,6,0"/>
+                <TextBlock Text="Authserver" Foreground="White" VerticalAlignment="Center"/>
+              </StackPanel>
+
+              <StackPanel Orientation="Horizontal">
+                <Ellipse x:Name="EllipseWorld" Width="14" Height="14" Margin="0,0,6,0"/>
+                <TextBlock Text="Worldserver" Foreground="White" VerticalAlignment="Center"/>
+              </StackPanel>
+            </WrapPanel>
+
+            <!-- Online Players moved into Status -->
+            <WrapPanel Grid.Row="3">
+              <TextBlock Text="Online Players:" Foreground="#FF86B5E5" Margin="0,0,6,0"/>
+              <TextBlock x:Name="TxtOnlinePlayers"
+                         Text="—"
+                         FontSize="16"
+                         FontWeight="Bold"
+                         Foreground="LimeGreen"/>
+            </WrapPanel>
+
+          </Grid>
+        </GroupBox>
+
+      </Grid>
+    </ScrollViewer>
+  </TabItem>
+
+  <!-- ================================================= -->
+  <!-- TAB 2: Configuration                              -->
+  <!-- ================================================= -->
+  <TabItem Header="Configuration">
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/> <!-- Server Paths -->
+          <RowDefinition Height="Auto"/> <!-- DB Settings -->
+          <RowDefinition Height="Auto"/> <!-- NTFY -->
+          <RowDefinition Height="Auto"/> <!-- Save Config -->
+        </Grid.RowDefinitions>
+
+        <!-- Server Paths -->
+        <GroupBox Grid.Row="0" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="Server Paths"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0" />
+              <GradientStop Color="#FF111623" Offset="1.0" />
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/> <!-- MySQL -->
+              <RowDefinition Height="Auto"/> <!-- MySQL EXE -->
+              <RowDefinition Height="Auto"/> <!-- Auth -->
+              <RowDefinition Height="Auto"/> <!-- World -->
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="MySQL start (.bat):" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox x:Name="TxtMySQL" Grid.Row="0" Grid.Column="1" Margin="4,2"
+                     Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
+            <Button x:Name="BtnBrowseMySQL" Grid.Row="0" Grid.Column="2" Content="Browse" MinWidth="80"
+                    Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="mysql.exe:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox x:Name="TxtMySQLExe" Grid.Row="1" Grid.Column="1" Margin="4,2"
+                     Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
+            <Button x:Name="BtnBrowseMySQLExe" Grid.Row="1" Grid.Column="2" Content="Browse" MinWidth="80"
+                    Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Authserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox x:Name="TxtAuth" Grid.Row="2" Grid.Column="1" Margin="4,2"
+                     Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
+            <Button x:Name="BtnBrowseAuth" Grid.Row="2" Grid.Column="2" Content="Browse" MinWidth="80"
+                    Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Worldserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox x:Name="TxtWorld" Grid.Row="3" Grid.Column="1" Margin="4,2"
+                     Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
+            <Button x:Name="BtnBrowseWorld" Grid.Row="3" Grid.Column="2" Content="Browse" MinWidth="80"
+                    Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+          </Grid>
+        </GroupBox>
+
+        <!-- DB Settings -->
+        <GroupBox Grid.Row="1"
+                  Margin="0,0,0,10"
+                  Foreground="White"
+                  HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="Database Settings"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0"/>
+              <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/> <!-- standout button row -->
+            </Grid.RowDefinitions>
+
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="110"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Host -->
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Host:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <TextBox x:Name="TxtDbHost" Grid.Row="0" Grid.Column="1" Margin="0,2,6,2"/>
+
+            <!-- Port -->
+            <TextBlock Grid.Row="0" Grid.Column="2" Text="Port:" VerticalAlignment="Center" Margin="6,0,6,0"/>
+            <TextBox x:Name="TxtDbPort" Grid.Row="0" Grid.Column="3" Margin="0,2,0,2"/>
+
+            <!-- User -->
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="User:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <TextBox x:Name="TxtDbUser" Grid.Row="1" Grid.Column="1" Margin="0,2,6,2"/>
+
+            <!-- DB Name -->
+            <TextBlock Grid.Row="1" Grid.Column="2" Text="DB:" VerticalAlignment="Center" Margin="6,0,6,0"/>
+            <TextBox x:Name="TxtDbNameChar" Grid.Row="1" Grid.Column="3" Margin="0,2,0,2"
+                     ToolTip="Character database name (defaults to legion_characters)"/>
+
+            <!-- Password -->
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Password:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <PasswordBox x:Name="TxtDbPassword" Grid.Row="2" Grid.Column="1" Margin="0,2,6,2"/>
+
+            <!-- Test DB -->
+            <Button x:Name="BtnTestDb" Grid.Row="2" Grid.Column="3"
+                    Content="Test DB" Width="110"
+                    Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E"
+                    Margin="0,2,0,2"/>
+
+            <!-- Standout Save Password -->
+            <Button x:Name="BtnSaveDbPassword"
+                    Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="4"
+                    Content="Store Database Password (Encrypted)"
+                    Height="34"
+                    Margin="0,8,0,0"
+                    Background="#FF3478BF"
+                    Foreground="White"
+                    BorderBrush="#FF2B5E9A"
+                    BorderThickness="1"/>
+
+            <TextBlock Grid.Row="4" Visibility="Collapsed"/>
+          </Grid>
+        </GroupBox>
+
+        <!-- NTFY Notifications (moved here) -->
+        <GroupBox Grid.Row="2" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="NTFY Notifications"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0"/>
+              <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <!-- (Unchanged: your entire existing NTFY grid) -->
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
-            <!-- Paths + Actions -->
-            <GroupBox Grid.Row="0" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
-              <GroupBox.Header>
-                <TextBlock Text="Server Paths"
-                           Foreground="#FFBDDCFF"
-                           FontWeight="SemiBold"/>
-              </GroupBox.Header>
-              <GroupBox.Background>
-                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-                  <GradientStop Color="#FF151B28" Offset="0.0" />
-                  <GradientStop Color="#FF111623" Offset="1.0" />
-                </LinearGradientBrush>
-              </GroupBox.Background>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
 
-              <Grid Margin="10">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/> <!-- MySQL -->
-                    <RowDefinition Height="Auto"/> <!-- Auth -->
-                    <RowDefinition Height="Auto"/> <!-- World -->
-                    <RowDefinition Height="Auto"/> <!-- Save / Watchdog -->
-                    <RowDefinition Height="Auto"/> <!-- Per-service buttons -->
-                    <RowDefinition Height="Auto"/> <!-- Start/Stop All -->
-                </Grid.RowDefinitions>
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="Auto"/>
-                  <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
+            <!-- Expansion -->
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Expansion:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="4,2">
+              <ComboBox x:Name="CmbExpansion"
+                        MinWidth="140"
+                        Background="#FF0F141F"
+                        Foreground="White"
+                        BorderBrush="#FF345A8A">
+                <ComboBoxItem Content="Classic" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="TBC" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="WotLK" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="MoP" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="Legion" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="BFA" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="Shadowlands" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="Dragonflight" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="Custom" Background="#FF0F141F" Foreground="White"/>
+              </ComboBox>
 
-                <TextBlock Grid.Row="0" Grid.Column="0" Text="MySQL start (.bat):" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-                <TextBox x:Name="TxtMySQL" Grid.Row="0" Grid.Column="1" Margin="4,2"
-                         Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
-                <Button x:Name="BtnBrowseMySQL" Grid.Row="0" Grid.Column="2" Content="Browse" MinWidth="80"
-                        Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+              <TextBox x:Name="TxtExpansionCustom"
+                       MinWidth="160"
+                       Margin="8,0,0,0"
+                       Background="#FF0F141F"
+                       Foreground="White"
+                       BorderBrush="#FF345A8A"
+                       Visibility="Collapsed"
+                       ToolTip="Custom expansion label (used only when Expansion = Custom)"/>
+            </StackPanel>
 
-                <TextBlock Grid.Row="1" Grid.Column="0" Text="Authserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-                <TextBox x:Name="TxtAuth" Grid.Row="1" Grid.Column="1" Margin="4,2"
-                         Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
-                <Button x:Name="BtnBrowseAuth" Grid.Row="1" Grid.Column="2" Content="Browse" MinWidth="80"
-                        Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+            <!-- NTFY Server -->
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="NTFY Server:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox Grid.Row="1" Grid.Column="1"
+                     x:Name="TxtNtfyServer"
+                     Margin="4,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
 
-                <TextBlock Grid.Row="2" Grid.Column="0" Text="Worldserver:" VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-                <TextBox x:Name="TxtWorld" Grid.Row="2" Grid.Column="1" Margin="4,2"
-                         Background="#FF0F141F" Foreground="White" BorderBrush="#FF345A8A"/>
-                <Button x:Name="BtnBrowseWorld" Grid.Row="2" Grid.Column="2" Content="Browse" MinWidth="80"
-                        Background="#FF1B2A42" Foreground="White" BorderBrush="#FF2B3E5E" Margin="6,2,0,2"/>
+            <!-- Topic -->
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Topic:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox Grid.Row="2" Grid.Column="1"
+                     x:Name="TxtNtfyTopic"
+                     Margin="4,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
 
-                <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="0,8,0,0">
-                  <Button x:Name="BtnSaveConfig" Content="Save Config" MinWidth="120"
-                          Background="#FF3478BF" Foreground="White" Margin="0,0,10,0"/>
-                  <Button x:Name="BtnStartWatchdog" Content="Start Watchdog" MinWidth="140"
-                          Background="#FF2D7A3A" Foreground="White" Margin="0,0,10,0"/>
-                  <Button x:Name="BtnStopWatchdog" Content="Stop Watchdog" MinWidth="140"
-                          Background="#FF7A3A3A" Foreground="White" />
-                </StackPanel>
+            <!-- Tags -->
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Tags:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <TextBox Grid.Row="3" Grid.Column="1"
+                     x:Name="TxtNtfyTags"
+                     Margin="4,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
 
-                <StackPanel Grid.Row="4"
-                            Grid.Column="0"
-                            Grid.ColumnSpan="3"
-                            Orientation="Horizontal"
-                            Margin="0,8,0,0">
- <Button x:Name="BtnStartMySQL"
-          Content="Start DB"
-          Width="90"
-          Margin="0,0,6,0"
-          Style="{StaticResource BtnStart}"/>
+            <!-- Auth Mode -->
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="Auth Mode:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <ComboBox Grid.Row="4" Grid.Column="1"
+                      x:Name="CmbNtfyAuthMode"
+                      MinWidth="160"
+                      Margin="4,2"
+                      Background="#FF0F141F"
+                      Foreground="White"
+                      BorderBrush="#FF345A8A">
+              <ComboBoxItem Content="None" IsSelected="True"/>
+              <ComboBoxItem Content="Basic (User/Pass)"/>
+              <ComboBoxItem Content="Token (Bearer)"/>
+            </ComboBox>
 
-  <Button x:Name="BtnStopMySQL"
-          Content="Stop DB"
-          Width="90"
-          Margin="0,0,12,0"
-          Style="{StaticResource BtnStop}"/>
+            <!-- Username -->
+            <TextBlock x:Name="LblNtfyUsername" Grid.Row="5" Grid.Column="0" Text="Username:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+            <TextBox Grid.Row="5" Grid.Column="1"
+                     x:Name="TxtNtfyUsername"
+                     Margin="4,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"
+                     Visibility="Collapsed"/>
 
-  <Button x:Name="BtnStartAuth"
-          Content="Start Auth"
-          Width="90"
-          Margin="0,0,6,0"
-          Style="{StaticResource BtnStart}"/>
+            <!-- Password -->
+            <TextBlock x:Name="LblNtfyPassword" Grid.Row="6" Grid.Column="0" Text="Password:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+            <PasswordBox Grid.Row="6" Grid.Column="1"
+                         x:Name="TxtNtfyPassword"
+                         Margin="4,2"
+                         Background="#FF0F141F"
+                         Foreground="White"
+                         BorderBrush="#FF345A8A"
+                         Visibility="Collapsed"/>
 
-  <Button x:Name="BtnStopAuth"
-          Content="Stop Auth"
-          Width="90"
-          Margin="0,0,12,0"
-          Style="{StaticResource BtnStop}"/>
+            <!-- Token -->
+            <TextBlock x:Name="LblNtfyToken" Grid.Row="7" Grid.Column="0" Text="Token:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
+            <PasswordBox Grid.Row="7" Grid.Column="1"
+                         x:Name="TxtNtfyToken"
+                         Margin="4,2"
+                         Background="#FF0F141F"
+                         Foreground="White"
+                         BorderBrush="#FF345A8A"
+                         Visibility="Collapsed"/>
 
-  <Button x:Name="BtnStartWorld"
-          Content="Start World"
-          Width="100"
-          Margin="0,0,6,0"
-          Style="{StaticResource BtnStart}"/>
+            <!-- Default Priority -->
+            <TextBlock Grid.Row="8" Grid.Column="0" Text="Priority:"
+                       VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
+            <ComboBox Grid.Row="8" Grid.Column="1"
+                      x:Name="CmbNtfyPriorityDefault"
+                      MinWidth="90"
+                      Background="#FF0F141F"
+                      Foreground="White"
+                      BorderBrush="#FF345A8A">
+              <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
+              <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
+              <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
+              <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
+              <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
+            </ComboBox>
 
-  <Button x:Name="BtnStopWorld"
-          Content="Stop World"
-          Width="100"
-          Style="{StaticResource BtnStop}"/>
-                </StackPanel>
+            <!-- Services -->
+            <Grid Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,6,0,0">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
 
-                <StackPanel Grid.Row="5"
-                            Grid.Column="0"
-                            Grid.ColumnSpan="3"
-                            Orientation="Horizontal"
-                            Margin="0,8,0,0">
-<Button x:Name="BtnStartAll"
-          Content="Start All (Ordered)"
-          Width="180"
-          Margin="0,0,10,0"
-          Style="{StaticResource BtnStart}"/>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
 
-  <Button x:Name="BtnStopAll"
-          Content="Stop All (Graceful)"
-          Width="180"
-          Style="{StaticResource BtnStop}"/>
-                </StackPanel>
-              </Grid>
-            </GroupBox>
+              <TextBlock Grid.Row="0" Grid.Column="0" Text="Services:"
+                         Foreground="White" VerticalAlignment="Center"/>
 
-            <!-- Status -->
-            <GroupBox Grid.Row="1" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
-              <GroupBox.Header>
-                <TextBlock Text="Status"
-                           Foreground="#FFBDDCFF"
-                           FontWeight="SemiBold"/>
-              </GroupBox.Header>
-              <GroupBox.Background>
-                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-                  <GradientStop Color="#FF151B28" Offset="0.0" />
-                  <GradientStop Color="#FF111623" Offset="1.0" />
-                </LinearGradientBrush>
-              </GroupBox.Background>
+              <!-- MySQL -->
+              <CheckBox Grid.Row="1" Grid.Column="0"
+                        x:Name="ChkNtfyMySQL"
+                        Content="MySQL"
+                        Foreground="White"/>
+              <ComboBox Grid.Row="1" Grid.Column="1"
+                        x:Name="CmbPriMySQL"
+                        MinWidth="90"
+                        Background="#FF0F141F"
+                        Foreground="White"
+                        BorderBrush="#FF345A8A">
+                <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
+              </ComboBox>
 
-              <Grid Margin="10">
-  <Grid.RowDefinitions>
-    <RowDefinition Height="Auto"/>
-    <RowDefinition Height="Auto"/>
-    <RowDefinition Height="Auto"/>
-  </Grid.RowDefinitions>
+              <!-- Authserver -->
+              <CheckBox Grid.Row="2" Grid.Column="0"
+                        x:Name="ChkNtfyAuthserver"
+                        Content="Authserver"
+                        Foreground="White"/>
+              <ComboBox Grid.Row="2" Grid.Column="1"
+                        x:Name="CmbPriAuthserver"
+                        MinWidth="90"
+                        Background="#FF0F141F"
+                        Foreground="White"
+                        BorderBrush="#FF345A8A">
+                <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
+              </ComboBox>
 
-  <!-- Watchdog runtime status -->
-  <WrapPanel Grid.Row="0" Margin="0,0,0,6">
-    <TextBlock Text="Watchdog:" Foreground="White" Margin="0,0,6,0"/>
-    <TextBlock x:Name="TxtWatchdogStatus"
-               Text="Stopped"
-               Foreground="Orange"
-               FontWeight="Bold"/>
-  </WrapPanel>
+              <!-- Worldserver -->
+              <CheckBox Grid.Row="3" Grid.Column="0"
+                        x:Name="ChkNtfyWorldserver"
+                        Content="Worldserver"
+                        Foreground="White"/>
+              <ComboBox Grid.Row="3" Grid.Column="1"
+                        x:Name="CmbPriWorldserver"
+                        MinWidth="90"
+                        Background="#FF0F141F"
+                        Foreground="White"
+                        BorderBrush="#FF345A8A">
+                <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
+                <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
+              </ComboBox>
 
-  <!-- Windows service status (secondary, quieter) -->
-  <WrapPanel Grid.Row="1" Margin="0,0,0,8">
-    <TextBlock Text="Service:"
-               Foreground="#FF86B5E5"
-               Margin="0,0,6,0"/>
-    <TextBlock x:Name="TxtServiceStatus"
-               Text="Not installed"
-               Foreground="#FFFFB347"
-               FontWeight="SemiBold"/>
-  </WrapPanel>
+              <!-- Triggers -->
+              <StackPanel Grid.Row="0" Grid.Column="2" Grid.RowSpan="4" Margin="10,0,0,0">
+                <CheckBox x:Name="ChkNtfyOnDown" Content="Send on DOWN" Foreground="White"/>
+                <CheckBox x:Name="ChkNtfyOnUp" Content="Send on UP" Foreground="White" Margin="0,6,0,0"/>
+                <Button x:Name="BtnTestNtfy" Content="Test Notification"
+                        Margin="0,10,0,0"
+                        Background="#FF3478BF"
+                        Foreground="White"/>
+              </StackPanel>
 
-  <!-- Process LEDs -->
-  <WrapPanel Grid.Row="2">
-    <StackPanel Orientation="Horizontal" Margin="0,0,18,0">
-      <Ellipse x:Name="EllipseMySQL" Width="14" Height="14" Margin="0,0,6,0"/>
-      <TextBlock Text="MySQL" Foreground="White" VerticalAlignment="Center"/>
-    </StackPanel>
-
-    <StackPanel Orientation="Horizontal" Margin="0,0,18,0">
-      <Ellipse x:Name="EllipseAuth" Width="14" Height="14" Margin="0,0,6,0"/>
-      <TextBlock Text="Authserver" Foreground="White" VerticalAlignment="Center"/>
-    </StackPanel>
-
-    <StackPanel Orientation="Horizontal">
-      <Ellipse x:Name="EllipseWorld" Width="14" Height="14" Margin="0,0,6,0"/>
-      <TextBlock Text="Worldserver" Foreground="White" VerticalAlignment="Center"/>
-    </StackPanel>
-  </WrapPanel>
-</Grid>
-            </GroupBox>
-
-<!-- NTFY Notifications -->
-<GroupBox Grid.Row="2" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
-  <GroupBox.Header>
-    <TextBlock Text="NTFY Notifications"
-               Foreground="#FFBDDCFF"
-               FontWeight="SemiBold"/>
-  </GroupBox.Header>
-
-  <GroupBox.Background>
-    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#FF151B28" Offset="0.0"/>
-      <GradientStop Color="#FF111623" Offset="1.0"/>
-    </LinearGradientBrush>
-  </GroupBox.Background>
-
-  <Grid Margin="10">
-  <Grid.RowDefinitions>
-    <RowDefinition Height="Auto"/> <!-- 0 Expansion -->
-    <RowDefinition Height="Auto"/> <!-- 1 Server -->
-    <RowDefinition Height="Auto"/> <!-- 2 Topic -->
-    <RowDefinition Height="Auto"/> <!-- 3 Tags -->
-    <RowDefinition Height="Auto"/> <!-- 4 Auth Mode -->
-    <RowDefinition Height="Auto"/> <!-- 5 Username -->
-    <RowDefinition Height="Auto"/> <!-- 6 Password -->
-    <RowDefinition Height="Auto"/> <!-- 7 Token -->
-    <RowDefinition Height="Auto"/> <!-- 8 Priority -->
-    <RowDefinition Height="Auto"/> <!-- 9 Services -->
-  </Grid.RowDefinitions>
-
-  <Grid.ColumnDefinitions>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="*"/>
-    <ColumnDefinition Width="Auto"/>
-  </Grid.ColumnDefinitions>
-
-  <!-- Expansion -->
-  <TextBlock Grid.Row="0" Grid.Column="0" Text="Expansion:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-
-  <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="4,2">
-    <ComboBox x:Name="CmbExpansion"
-              MinWidth="140"
-              Background="#FF0F141F"
-              Foreground="White"
-              BorderBrush="#FF345A8A">
-      <ComboBoxItem Content="Classic" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="TBC" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="WotLK" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="MoP" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="Legion" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="BFA" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="Shadowlands" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="Dragonflight" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="Custom" Background="#FF0F141F" Foreground="White"/>
-    </ComboBox>
-
-    <TextBox x:Name="TxtExpansionCustom"
-             MinWidth="160"
-             Margin="8,0,0,0"
-             Background="#FF0F141F"
-             Foreground="White"
-             BorderBrush="#FF345A8A"
-             Visibility="Collapsed"
-             ToolTip="Custom expansion label (used only when Expansion = Custom)"/>
-  </StackPanel>
-
-  <!-- NTFY Server -->
-  <TextBlock Grid.Row="1" Grid.Column="0" Text="NTFY Server:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <TextBox Grid.Row="1" Grid.Column="1"
-           x:Name="TxtNtfyServer"
-           Margin="4,2"
-           Background="#FF0F141F"
-           Foreground="White"
-           BorderBrush="#FF345A8A"/>
-
-  <!-- Topic -->
-  <TextBlock Grid.Row="2" Grid.Column="0" Text="Topic:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <TextBox Grid.Row="2" Grid.Column="1"
-           x:Name="TxtNtfyTopic"
-           Margin="4,2"
-           Background="#FF0F141F"
-           Foreground="White"
-           BorderBrush="#FF345A8A"/>
-
-  <!-- Tags -->
-  <TextBlock Grid.Row="3" Grid.Column="0" Text="Tags:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <TextBox Grid.Row="3" Grid.Column="1"
-           x:Name="TxtNtfyTags"
-           Margin="4,2"
-           Background="#FF0F141F"
-           Foreground="White"
-           BorderBrush="#FF345A8A"/>
-
-<!-- Auth Mode -->
-<TextBlock Grid.Row="4" Grid.Column="0" Text="Auth Mode:"
-           VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-<ComboBox Grid.Row="4" Grid.Column="1"
-          x:Name="CmbNtfyAuthMode"
-          MinWidth="160"
-          Margin="4,2"
-          Background="#FF0F141F"
-          Foreground="White"
-          BorderBrush="#FF345A8A">
-  <ComboBoxItem Content="None" IsSelected="True"/>
-  <ComboBoxItem Content="Basic (User/Pass)"/>
-  <ComboBoxItem Content="Token (Bearer)"/>
-</ComboBox>
-
-  <!-- Username -->
-  <TextBlock x:Name="LblNtfyUsername" Grid.Row="5" Grid.Column="0" Text="Username:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
-  <TextBox Grid.Row="5" Grid.Column="1"
-           x:Name="TxtNtfyUsername"
-           Margin="4,2"
-           Background="#FF0F141F"
-           Foreground="White"
-           BorderBrush="#FF345A8A"
-           Visibility="Collapsed"/>
-
-  <!-- Password -->
-  <TextBlock x:Name="LblNtfyPassword" Grid.Row="6" Grid.Column="0" Text="Password:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
-  <PasswordBox Grid.Row="6" Grid.Column="1"
-               x:Name="TxtNtfyPassword"
-               Margin="4,2"
-               Background="#FF0F141F"
-               Foreground="White"
-               BorderBrush="#FF345A8A"
-               Visibility="Collapsed"/>
-
-               <!-- Token -->
-    <TextBlock x:Name="LblNtfyToken" Grid.Row="7" Grid.Column="0" Text="Token:"
-           VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0" Visibility="Collapsed"/>
-    <PasswordBox Grid.Row="7" Grid.Column="1"
-             x:Name="TxtNtfyToken"
-             Margin="4,2"
-             Background="#FF0F141F"
-             Foreground="White"
-             BorderBrush="#FF345A8A"
-             Visibility="Collapsed"/>               
-
-  <!-- Default Priority -->
-  <TextBlock Grid.Row="8" Grid.Column="0" Text="Priority:"
-             VerticalAlignment="Center" Foreground="White" Margin="0,0,4,0"/>
-  <ComboBox Grid.Row="8" Grid.Column="1"
-            x:Name="CmbNtfyPriorityDefault"
-            MinWidth="90"
-            Background="#FF0F141F"
-            Foreground="White"
-            BorderBrush="#FF345A8A">
-    <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
-    <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
-    <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
-    <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
-    <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
-  </ComboBox>
-
-  <!-- Services -->
-  <Grid Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,6,0,0">
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-
-    <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="*"/>
-      <ColumnDefinition Width="Auto"/>
-      <ColumnDefinition Width="Auto"/>
-    </Grid.ColumnDefinitions>
-
-    <TextBlock Grid.Row="0" Grid.Column="0" Text="Services:"
-               Foreground="White" VerticalAlignment="Center"/>
-
-    <!-- MySQL -->
-    <CheckBox Grid.Row="1" Grid.Column="0"
-              x:Name="ChkNtfyMySQL"
-              Content="MySQL"
-              Foreground="White"/>
-    <ComboBox Grid.Row="1" Grid.Column="1"
-              x:Name="CmbPriMySQL"
-              MinWidth="90"
-              Background="#FF0F141F"
-              Foreground="White"
-              BorderBrush="#FF345A8A">
-      <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
-    </ComboBox>
-
-    <!-- Authserver -->
-    <CheckBox Grid.Row="2" Grid.Column="0"
-              x:Name="ChkNtfyAuthserver"
-              Content="Authserver"
-              Foreground="White"/>
-    <ComboBox Grid.Row="2" Grid.Column="1"
-              x:Name="CmbPriAuthserver"
-              MinWidth="90"
-              Background="#FF0F141F"
-              Foreground="White"
-              BorderBrush="#FF345A8A">
-      <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
-    </ComboBox>
-
-    <!-- Worldserver -->
-    <CheckBox Grid.Row="3" Grid.Column="0"
-              x:Name="ChkNtfyWorldserver"
-              Content="Worldserver"
-              Foreground="White"/>
-    <ComboBox Grid.Row="3" Grid.Column="1"
-              x:Name="CmbPriWorldserver"
-              MinWidth="90"
-              Background="#FF0F141F"
-              Foreground="White"
-              BorderBrush="#FF345A8A">
-      <ComboBoxItem Content="Auto" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="1" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="2" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="3" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="4" Background="#FF0F141F" Foreground="White"/>
-      <ComboBoxItem Content="5" Background="#FF0F141F" Foreground="White"/>
-    </ComboBox>
-
-    <!-- Triggers -->
-    <StackPanel Grid.Row="0" Grid.Column="2" Grid.RowSpan="4" Margin="10,0,0,0">
-      <CheckBox x:Name="ChkNtfyOnDown" Content="Send on DOWN" Foreground="White"/>
-      <CheckBox x:Name="ChkNtfyOnUp" Content="Send on UP" Foreground="White" Margin="0,6,0,0"/>
-      <Button x:Name="BtnTestNtfy" Content="Test Notification"
-              Margin="0,10,0,0"
-              Background="#FF3478BF"
-              Foreground="White"/>
-    </StackPanel>
-
-  </Grid>
-</Grid>
-</GroupBox>   
+            </Grid>
           </Grid>
-        </ScrollViewer>
+        </GroupBox>
+
+        <!-- Save Config (prominent, bottom) -->
+        <GroupBox Grid.Row="3" Foreground="White" HorizontalAlignment="Stretch" Margin="0,0,0,10">
+          <GroupBox.Header>
+            <TextBlock Text="Save"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0"/>
+              <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <StackPanel Margin="10">
+            <TextBlock Text="Save configuration changes (paths, database settings, NTFY settings)."
+                       Foreground="#FF86B5E5"
+                       Margin="0,0,0,8"/>
+            <Button x:Name="BtnSaveConfig"
+                    Content="Save Configuration"
+                    Height="38"
+                    Background="#FF3478BF"
+                    Foreground="White"
+                    BorderBrush="#FF2B5E9A"
+                    BorderThickness="1"/>
+          </StackPanel>
+        </GroupBox>
+
+      </Grid>
+    </ScrollViewer>
+  </TabItem>
+
+</TabControl>
+
 
         <!-- Live Log (independent scroll) -->
 <GroupBox Grid.Row="1" Foreground="White" HorizontalAlignment="Stretch" Margin="0,8,0,0">
@@ -957,7 +1273,6 @@ $xaml = @"
     </LinearGradientBrush>
   </GroupBox.Background>
 
-  <!-- IMPORTANT: this grid defines the two rows -->
   <Grid Margin="10">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
@@ -1028,7 +1343,7 @@ try {
 
 
 # -------------------------------------------------
-# Apply program icon (WoWWatcher.ico preferred; fallback to MoPWatcher.ico)
+# Apply program icon
 # -------------------------------------------------
 $IconPath = Join-Path $ScriptDir "WoWWatcher.ico"
 $LegacyIconPath = Join-Path $ScriptDir "MoPWatcher.ico"
@@ -1055,6 +1370,11 @@ $BtnMinimize        = $Window.FindName("BtnMinimize")
 $BtnClose           = $Window.FindName("BtnClose")
 
 $TxtMySQL           = $Window.FindName("TxtMySQL")
+$TxtMySQLExe       = $Window.FindName("TxtMySQLExe")
+$BtnBrowseMySQLExe = $Window.FindName("BtnBrowseMySQLExe")
+
+$TxtMySQLExe.Text = $Config.MySQLExe
+
 $TxtAuth            = $Window.FindName("TxtAuth")
 $TxtWorld           = $Window.FindName("TxtWorld")
 
@@ -1082,7 +1402,7 @@ $TxtNtfyTopic          = $Window.FindName("TxtNtfyTopic")
 $CmbNtfyAuthMode       = $Window.FindName("CmbNtfyAuthMode")
 $TxtNtfyTags           = $Window.FindName("TxtNtfyTags")
 $TxtNtfyUsername       = $Window.FindName("TxtNtfyUsername")
-$TxtNtfyPassword       = $Window.FindName("TxtNtfyPassword")  # PasswordBox
+$TxtNtfyPassword       = $Window.FindName("TxtNtfyPassword")
 $TxtNtfyToken          = $Window.FindName("TxtNtfyToken")
 $LblNtfyUsername       = $Window.FindName("LblNtfyUsername")
 $LblNtfyPassword       = $Window.FindName("LblNtfyPassword")
@@ -1112,10 +1432,65 @@ $BtnStartAll    = $Window.FindName("BtnStartAll")
 $BtnStopAll     = $Window.FindName("BtnStopAll")
 $BtnClearLog    = $Window.FindName("BtnClearLog")
 
+# Server Info: DB controls
+$TxtDbHost        = $Window.FindName("TxtDbHost")
+$TxtDbPort        = $Window.FindName("TxtDbPort")
+$TxtDbUser        = $Window.FindName("TxtDbUser")
+$TxtDbNameChar    = $Window.FindName("TxtDbNameChar")
+$TxtDbPassword    = $Window.FindName("TxtDbPassword")
+$BtnSaveDbPassword= $Window.FindName("BtnSaveDbPassword")
+$BtnTestDb        = $Window.FindName("BtnTestDb")
+
+# Tab 2: Server Info
+$TxtOnlinePlayers = $Window.FindName("TxtOnlinePlayers")
+
+$script:LastPlayerPollError = $null
+
+$PlayerPollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$PlayerPollTimer.Interval = [TimeSpan]::FromSeconds(5)
+
+$PlayerPollTimer.Add_Tick({
+    try {
+        $count = Get-OnlinePlayerCountCached_Legion
+
+        $TxtOnlinePlayers.Text = [string]$count
+
+        if ($count -gt 0) {
+            $TxtOnlinePlayers.Foreground = [System.Windows.Media.Brushes]::LimeGreen
+        } else {
+            $TxtOnlinePlayers.Foreground = [System.Windows.Media.Brushes]::Gold
+        }
+    } catch {
+        $TxtOnlinePlayers.Text = "—"
+        $TxtOnlinePlayers.Foreground = [System.Windows.Media.Brushes]::Tomato
+    }
+})
+
+# Start only if implemented
+if (Get-Command Get-OnlinePlayerCount_Legion -ErrorAction SilentlyContinue) {
+    $PlayerPollTimer.Start()
+} else {
+    $TxtOnlinePlayers.Text = "—"
+}
+
 # Initial values from config
 $TxtMySQL.Text  = $Config.MySQL
 $TxtAuth.Text   = $Config.Authserver
 $TxtWorld.Text  = $Config.Worldserver
+
+if ([string]::IsNullOrWhiteSpace([string]$Config.DbHost))     { $Config.DbHost = "127.0.0.1" }
+if (-not $Config.DbPort)                                      { $Config.DbPort = 3306 }
+if ([string]::IsNullOrWhiteSpace([string]$Config.DbUser))     { $Config.DbUser = "root" }
+if ([string]::IsNullOrWhiteSpace([string]$Config.DbNameChar)) { $Config.DbNameChar = "legion_characters" }
+
+$TxtDbHost.Text     = [string]$Config.DbHost
+$TxtDbPort.Text     = [string]$Config.DbPort
+$TxtDbUser.Text     = [string]$Config.DbUser
+$TxtDbNameChar.Text = [string]$Config.DbNameChar
+
+# Never auto-fill password into UI; keep blank
+try { $TxtDbPassword.Password = "" } catch { }
+
 
 $TxtServiceStatus = $Window.FindName("TxtServiceStatus")
 
@@ -1134,7 +1509,6 @@ function Get-SelectedComboContent {
     return [string]$item
 }
 
-
 function Update-NtfyAuthUI {
 
     $mode = ""
@@ -1151,7 +1525,6 @@ function Update-NtfyAuthUI {
             $TxtNtfyPassword.Visibility = "Visible"
             $TxtNtfyToken.Visibility    = "Collapsed"
 
-            # Optional (recommended): if you have label TextBlocks, toggle them too
             if ($LblNtfyUsername) { $LblNtfyUsername.Visibility = "Visible" }
             if ($LblNtfyPassword) { $LblNtfyPassword.Visibility = "Visible" }
             if ($LblNtfyToken)    { $LblNtfyToken.Visibility    = "Collapsed" }
@@ -1179,12 +1552,9 @@ function Update-NtfyAuthUI {
     }
 }
 
-# Run once after you set SelectedItem from config
 Update-NtfyAuthUI
 
-# Update when changed
 $CmbNtfyAuthMode.Add_SelectionChanged({ Update-NtfyAuthUI })
-
 
 function Get-WowWatchdogService {
     try { return Get-Service -Name $ServiceName -ErrorAction Stop } catch { return $null }
@@ -1344,7 +1714,7 @@ $TxtNtfyTopic.Text    = [string]$Config.NTFY.Topic
 $TxtNtfyTags.Text     = [string]$Config.NTFY.Tags
 $TxtNtfyUsername.Text = [string]$Config.NTFY.Username
 
-# AuthMode (select matching item; backward compatible)
+# AuthMode
 $mode = "None"
 try {
     if ($Config.NTFY -and $Config.NTFY.PSObject.Properties["AuthMode"]) {
@@ -1355,7 +1725,7 @@ try {
 
 [void](Select-ComboItemByContent -Combo $CmbNtfyAuthMode -Content $mode)
 
-# DPAPI mode: do NOT load secrets into UI (recommended)
+# DPAPI mode: do NOT load secrets into UI
 # (Send logic will pull from secrets store if boxes are empty)
 try { $TxtNtfyPassword.Password = "" } catch { }
 try { $TxtNtfyToken.Password    = "" } catch { }
@@ -1475,7 +1845,6 @@ function Get-NtfyAuthHeaders {
 function Add-GuiLog {
     param([string]$Message)
 
-    # Always write to file so the timer refresh never "erases" GUI messages
     try {
         $tsFile = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         Add-Content -Path $LogPath -Value "[$tsFile] $Message" -Encoding UTF8
@@ -1917,6 +2286,12 @@ function Update-ServiceStates {
     $EllipseWorld.Fill  = if ($global:WorldUp) { $g } else { $BrushLedRed }
 }
 
+function Test-DbConnection {
+    # Basic “can we query” test using the same mysql.exe pathway as the player count.
+    $null = Get-OnlinePlayerCount_Legion
+    return $true
+}
+
 # -------------------------------------------------
 # Service control buttons (Hold-aware)
 # -------------------------------------------------
@@ -1980,6 +2355,37 @@ $BtnClearLog.Add_Click({
     }
 })
 
+$BtnTestDb.Add_Click({
+    try {
+        $ok = Test-DbConnection
+        if ($ok) {
+            Add-GuiLog "DB test succeeded (able to query characters.online)."
+        }
+    } catch {
+        Add-GuiLog "ERROR: DB test failed: $_"
+    }
+})
+
+$BtnSaveDbPassword.Add_Click({
+    try {
+        $pw = ""
+        try { $pw = [string]$TxtDbPassword.Password } catch { $pw = "" }
+
+        if ([string]::IsNullOrWhiteSpace($pw)) {
+            Remove-DbSecretPassword
+            Add-GuiLog "DB password removed from secrets store (blank)."
+        } else {
+            Set-DbSecretPassword -Plain $pw
+            Add-GuiLog "DB password saved to secrets store (DPAPI)."
+        }
+
+        # Clear the box after save so it doesn't linger
+        try { $TxtDbPassword.Password = "" } catch { }
+    } catch {
+        Add-GuiLog "ERROR: Failed saving DB password: $_"
+    }
+})
+
 $BtnMinimize.Add_Click({ $Window.WindowState = 'Minimized' })
 $BtnClose.Add_Click({ $Window.Close() })
 
@@ -2007,7 +2413,7 @@ $BtnSaveConfig.Add_Click({
         if ([string]::IsNullOrWhiteSpace($expVal)) { $expVal = "Custom" }
     }
 
-    # Resolve Auth Mode selection (PS 5.1-safe)
+    # Resolve Auth Mode selection
 $authMode = "None"
 try {
     $sel = $CmbNtfyAuthMode.SelectedItem
@@ -2026,7 +2432,6 @@ if ($authMode -eq "Basic (User/Pass)") {
         Set-NtfySecret -Kind "BasicPassword" -Plain $plainPw
     }
 
-    # optional cross-mode cleanup
     Remove-NtfySecret -Kind "Token"
 }
 elseif ($authMode -eq "Token (Bearer)") {
@@ -2063,14 +2468,33 @@ else {
     $prioDefault = Get-ComboContentIntOrZero $CmbNtfyPriorityDefault
     if ($prioDefault -lt 1 -or $prioDefault -gt 5) { $prioDefault = 4 }
 
+    # DB fields from UI
+$dbHostName = [string]$TxtDbHost.Text
+if ([string]::IsNullOrWhiteSpace($dbHostName)) { $dbHostName = "127.0.0.1" }
+
+$dbPortNum = 3306
+try { $dbPortNum = [int]([string]$TxtDbPort.Text) } catch { $dbPortNum = 3306 }
+
+$dbUserName = [string]$TxtDbUser.Text
+if ([string]::IsNullOrWhiteSpace($dbUserName)) { $dbUserName = "root" }
+
+$dbNameChars = [string]$TxtDbNameChar.Text
+if ([string]::IsNullOrWhiteSpace($dbNameChars)) { $dbNameChars = "legion_characters" }
+
     $cfg = [pscustomobject]@{
-        # Optional identity metadata used for richer alerts
         ServerName  = $Config.ServerName
         Expansion   = $expVal
 
         MySQL       = $TxtMySQL.Text
+        MySQLExe    = $TxtMySQLExe.Text
         Authserver  = $TxtAuth.Text
         Worldserver = $TxtWorld.Text
+
+        DbHost      = $dbHostName
+        DbPort      = $dbPortNum
+        DbUser      = $dbUserName
+        DbNameChar  = $dbNameChars
+
 
         NTFY = [pscustomobject]@{
             Server            = $TxtNtfyServer.Text
@@ -2111,6 +2535,11 @@ else {
 $BtnStartWatchdog.Add_Click({ Start-WatchdogPreferred })
 $BtnStopWatchdog.Add_Click({ Stop-WatchdogPreferred })
 $BtnTestNtfy.Add_Click({ Send-NTFYTest })
+$BtnBrowseMySQLExe.Add_Click({
+    $f = Pick-File "mysql.exe (mysql.exe)|mysql.exe|Executables (*.exe)|*.exe|All files (*.*)|*.*"
+    if ($f) { $TxtMySQLExe.Text = $f }
+})
+if ($TxtMySQLExe) { $TxtMySQLExe.Text = [string]$Config.MySQLExe }
 
 # -------------------------------------------------
 # Timer – update status + log view

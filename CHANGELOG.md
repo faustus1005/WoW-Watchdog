@@ -34,3 +34,14 @@ Feature Improvements:
   At reload of the app, there is no need to fill in the Password/Token fields, though they may display as empty
   the secret is automatically pulled and used from secrets.json.
 - Starting window height increased, as it was too short to accomodate all the recent additions
+
+## v1.1.7 – Minor release
+Feature Improvements:
+- The application has now been split into two tabs, "Main" and "Configuration"
+  - Main contains the Control buttons (start/stops) and Status info.
+  - Configuration contains all the required config options needed to make the features in Main function.
+
+New Feature:
+- There is now a "Online Players" status in the Main page. This will show either a - (if not configured or DB isn't reachable) or a number indicating the online player count.
+- In the configuration tab mysql.exe location has been added to Server Paths - this is required at current as it relies on the mysql.exe to gather online player information.
+- Database settings, host, user, password, port, DB name, a test DB button, and save DB password button.
