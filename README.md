@@ -4,7 +4,8 @@
 
 <p align="center">Your ultimate companion for monitoring World of Warcraft private servers.</p>
 
-![screen](https://github.com/user-attachments/assets/8ba946d7-6049-4b94-9b6b-d1a2398dbd43)
+![screen](https://github.com/user-attachments/assets/d5133eef-e738-425a-a967-a8c347a719c9)
+![screen2](https://github.com/user-attachments/assets/0338bb5f-674a-4a09-a9ea-e95768789414)
 
 ## 📖 Overview
 
