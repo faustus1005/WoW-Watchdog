@@ -1,0 +1,7 @@
+## ToDo List
+*   Add tool tab with the following:
+  *   Database backup / Recovery
+  *   Integrate with Skeezix's SPP V2 Management Tool
+  *   BattlePay editor tool
+*	Add update notification, possibly automated updates
+*	Portable version of the launcher, or make the Windows service optional
