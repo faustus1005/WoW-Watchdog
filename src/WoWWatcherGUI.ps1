@@ -85,6 +85,9 @@ function Write-JsonFile {
     $Object | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
+$AppVersion = [version]"1.1.8"
+$RepoOwner  = "FAUSTUS1005"
+$RepoName   = "WoW-Watchdog"
 
 # -------------------------------------------------
 # Paths / constants
@@ -445,6 +448,68 @@ function Get-OnlinePlayerCountCached_Legion {
     return [int]$val
 }
 
+function Get-LatestGitHubRelease {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo
+    )
+
+    $uri = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
+    $headers = @{
+        "User-Agent" = "WoWWatchdog"
+        "Accept"     = "application/vnd.github+json"
+    }
+
+    # If rate limited enable
+    # $headers["Authorization"] = "Bearer $($env:GITHUB_TOKEN)"
+
+    return Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+}
+
+function Parse-ReleaseVersion {
+    param([string]$TagName)
+
+    # Normalize null / empty
+    $t = ""
+    if ($TagName) {
+        $t = $TagName.Trim()
+    }
+
+    # Supports tags like "v1.2.3" or "1.2.3"
+    if ($t.StartsWith("v")) {
+        $t = $t.Substring(1)
+    }
+
+    return [version]$t
+}
+
+function Get-LatestInstallerAsset {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [string]$ExpectedAssetName = "WoWWatchdog-Setup.exe"
+    )
+
+    $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
+
+    if (-not $rel.assets -or $rel.assets.Count -lt 1) {
+        throw "Latest release '$($rel.tag_name)' has no assets. Upload the installer EXE to the release."
+    }
+
+    $asset = $rel.assets | Where-Object { $_.name -eq $ExpectedAssetName } | Select-Object -First 1
+    if (-not $asset) {
+        $names = ($rel.assets | ForEach-Object { $_.name }) -join ", "
+        throw "Could not find expected asset '$ExpectedAssetName' in latest release assets: $names"
+    }
+
+    return [pscustomobject]@{
+        LatestVersion       = (Parse-ReleaseVersion -TagName $rel.tag_name)
+        InstallerUrl        = $asset.browser_download_url   # IMPORTANT
+        AssetName           = $asset.name
+        ReleaseTag          = $rel.tag_name
+    }
+}
+
 # -------------------------------------------------
 # XAML – Dark/Blue Theme
 # -------------------------------------------------
@@ -778,6 +843,7 @@ $xaml = @"
               <RowDefinition Height="Auto"/> <!-- Service -->
               <RowDefinition Height="Auto"/> <!-- LEDs -->
               <RowDefinition Height="Auto"/> <!-- Online players -->
+              <RowDefinition Height="Auto"/> <!-- Resource utilization (NEW) -->
             </Grid.RowDefinitions>
 
             <WrapPanel Grid.Row="0" Margin="0,0,0,6">
@@ -824,6 +890,42 @@ $xaml = @"
                          FontWeight="Bold"
                          Foreground="LimeGreen"/>
             </WrapPanel>
+
+            <!-- Resource Utilization (snapshot) -->
+            <Grid Grid.Row="4" Margin="0,10,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/> <!-- header -->
+                <RowDefinition Height="Auto"/> <!-- mysql -->
+                <RowDefinition Height="Auto"/> <!-- auth -->
+                <RowDefinition Height="Auto"/> <!-- world -->
+            </Grid.RowDefinitions>
+
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="90"/>
+                <ColumnDefinition Width="110"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
+                        Text="Resource Utilization (Snapshot)"
+                        Foreground="#FF86B5E5"
+                        Margin="0,0,0,6"/>
+
+            <!-- MySQL -->
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="MySQL:" Foreground="White" Margin="0,0,8,4"/>
+            <TextBlock Grid.Row="1" Grid.Column="1" x:Name="TxtUtilMySQLCpu" Text="CPU: —" Foreground="White" Margin="0,0,8,4"/>
+            <TextBlock Grid.Row="1" Grid.Column="2" x:Name="TxtUtilMySQLMem" Text="RAM: —" Foreground="White" Margin="0,0,0,4"/>
+
+            <!-- Authserver -->
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Auth:" Foreground="White" Margin="0,0,8,4"/>
+            <TextBlock Grid.Row="2" Grid.Column="1" x:Name="TxtUtilAuthCpu" Text="CPU: —" Foreground="White" Margin="0,0,8,4"/>
+            <TextBlock Grid.Row="2" Grid.Column="2" x:Name="TxtUtilAuthMem" Text="RAM: —" Foreground="White" Margin="0,0,0,4"/>
+
+            <!-- Worldserver -->
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="World:" Foreground="White"/>
+            <TextBlock Grid.Row="3" Grid.Column="1" x:Name="TxtUtilWorldCpu" Text="CPU: —" Foreground="White" Margin="0,0,8,0"/>
+            <TextBlock Grid.Row="3" Grid.Column="2" x:Name="TxtUtilWorldMem" Text="RAM: —" Foreground="White"/>
+            </Grid>
 
           </Grid>
         </GroupBox>
@@ -923,6 +1025,7 @@ $xaml = @"
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/> <!-- standout button row -->
+              <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <Grid.ColumnDefinitions>
@@ -1255,8 +1358,126 @@ $xaml = @"
     </ScrollViewer>
   </TabItem>
 
-</TabControl>
+ <!-- ================================================= -->
+  <!-- TAB 3: Tools (EMPTY FOR NOW)                      -->
+  <!-- ================================================= -->
+  <TabItem Header="Tools">
+    <Grid Margin="12">
+      <TextBlock Text="Tools"
+                 FontSize="16"
+                 FontWeight="SemiBold"
+                 Foreground="#FFBDDCFF"
+                 Margin="0,0,0,8"/>
 
+      <TextBlock Text="Future utilities and diagnostics will appear here."
+                 Foreground="#FF86B5E5"/>
+    </Grid>
+  </TabItem>
+
+  <!-- ================================================= -->
+  <!-- TAB 4: Updates                                   -->
+  <!-- ================================================= -->
+  <TabItem Header="Updates">
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+
+      <Grid Margin="12">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <TextBlock Grid.Row="0"
+                   Text="Application Updates"
+                   FontSize="16"
+                   FontWeight="SemiBold"
+                   Foreground="#FFBDDCFF"
+                   Margin="0,0,0,10"/>
+
+        <!-- Update Status -->
+        <GroupBox Grid.Row="1"
+                  Margin="0,0,0,10"
+                  Foreground="White"
+                  HorizontalAlignment="Stretch">
+
+          <GroupBox.Header>
+            <TextBlock Text="Version Status"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0"/>
+              <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Version info -->
+            <WrapPanel Grid.Row="0" Margin="0,0,0,8">
+              <TextBlock Text="Current Version:"
+                         Foreground="#FF86B5E5"
+                         Margin="0,0,6,0"/>
+
+              <TextBlock x:Name="TxtCurrentVersion"
+                         Text="—"
+                         FontWeight="SemiBold"
+                         Foreground="White"/>
+
+              <TextBlock Text="   Latest Version:"
+                         Foreground="#FF86B5E5"
+                         Margin="16,0,6,0"/>
+
+              <TextBlock x:Name="TxtLatestVersion"
+                         Text="—"
+                         FontWeight="SemiBold"
+                         Foreground="White"/>
+            </WrapPanel>
+
+            <!-- Buttons -->
+            <StackPanel Grid.Row="1"
+                        Orientation="Horizontal">
+
+              <Button x:Name="BtnCheckUpdates"
+                      Content="Check for Updates"
+                      MinWidth="160"
+                      Margin="0,0,10,0"
+                      Background="#FF1B2A42"
+                      Foreground="White"
+                      BorderBrush="#FF2B3E5E"/>
+
+              <Button x:Name="BtnUpdateNow"
+                      Content="Update Now"
+                      MinWidth="140"
+                      Background="#FF3478BF"
+                      Foreground="White"
+                      Visibility="Collapsed"/>
+            </StackPanel>
+
+          </Grid>
+        </GroupBox>
+
+        <!-- Notes -->
+        <TextBlock Grid.Row="2"
+                   TextWrapping="Wrap"
+                   Foreground="#FF86B5E5">
+This application checks GitHub releases to determine if a newer version is available.
+Updates are applied in-place and may restart services if required.
+        </TextBlock>
+
+      </Grid>
+    </ScrollViewer>
+  </TabItem>
+
+</TabControl>
 
         <!-- Live Log (independent scroll) -->
 <GroupBox Grid.Row="1" Foreground="White" HorizontalAlignment="Stretch" Margin="0,8,0,0">
@@ -1340,7 +1561,6 @@ try {
     )
     return
 }
-
 
 # -------------------------------------------------
 # Apply program icon
@@ -1441,7 +1661,50 @@ $TxtDbPassword    = $Window.FindName("TxtDbPassword")
 $BtnSaveDbPassword= $Window.FindName("BtnSaveDbPassword")
 $BtnTestDb        = $Window.FindName("BtnTestDb")
 
-# Tab 2: Server Info
+$TxtUtilMySQLCpu  = $Window.FindName("TxtUtilMySQLCpu")
+$TxtUtilMySQLMem  = $Window.FindName("TxtUtilMySQLMem")
+$TxtUtilAuthCpu   = $Window.FindName("TxtUtilAuthCpu")
+$TxtUtilAuthMem   = $Window.FindName("TxtUtilAuthMem")
+$TxtUtilWorldCpu  = $Window.FindName("TxtUtilWorldCpu")
+$TxtUtilWorldMem  = $Window.FindName("TxtUtilWorldMem")
+
+# Tab: Update
+$TxtCurrentVersion = $Window.FindName("TxtCurrentVersion")
+$TxtLatestVersion  = $Window.FindName("TxtLatestVersion")
+$BtnCheckUpdates   = $Window.FindName("BtnCheckUpdates")
+$BtnUpdateNow      = $Window.FindName("BtnUpdateNow")
+
+$TxtCurrentVersion.Text = $AppVersion.ToString()
+
+function Update-UpdateIndicator {
+    try {
+        $rel = Get-LatestGitHubRelease -Owner $RepoOwner -Repo $RepoName
+        $latest = Parse-ReleaseVersion $rel.tag_name
+
+        $TxtLatestVersion.Text = $latest.ToString()
+
+        if ($latest -gt $AppVersion) {
+            $TxtLatestVersion.Foreground = [System.Windows.Media.Brushes]::LimeGreen
+            $BtnUpdateNow.Visibility = "Visible"
+            Add-GuiLog "Update available: $AppVersion -> $latest"
+        } else {
+            $TxtLatestVersion.Foreground = [System.Windows.Media.Brushes]::White
+            $BtnUpdateNow.Visibility = "Collapsed"
+            Add-GuiLog "No update available (current: $AppVersion, latest: $latest)."
+        }
+
+        # Store release JSON so Update Now can reuse it without re-querying
+        $script:LatestReleaseInfo = $rel
+    }
+    catch {
+        Add-GuiLog "ERROR: Update check failed: $_"
+    }
+}
+
+$BtnCheckUpdates.Add_Click({ Update-UpdateIndicator })
+
+
+# Tab 1: Server Info
 $TxtOnlinePlayers = $Window.FindName("TxtOnlinePlayers")
 
 $script:LastPlayerPollError = $null
@@ -1704,7 +1967,105 @@ function Stop-WatchdogPreferred {
     }
 }
 
+function Start-InnoUpdateFromUrl {
+    param(
+        [Parameter(Mandatory=$true)][string]$InstallerUrl,
+        [Parameter(Mandatory=$true)][version]$LatestVersion,
 
+        # Asset hygiene
+        [string]$ExpectedAssetName = "WoWWatchdog-Setup.exe",
+        [string]$ActualAssetName   = $null,   # pass release asset name
+
+        # Basic integrity checks
+        [int64]$MinBytes = 2034408,            # KB floor; adjust to installer size
+        [string]$ExpectedSha256 = $null,
+
+        # If your install location requires elevation, set to $true
+        [switch]$RunAsAdmin
+    )
+
+    # ensure TLS 1.2 for GitHub
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+        if ($ExpectedAssetName) {
+        $nameToCheck = if ($ActualAssetName) {
+            $ActualAssetName
+        } else {
+            [IO.Path]::GetFileName((($InstallerUrl -split '\?')[0]))
+        }
+
+        if ($nameToCheck -and ($nameToCheck -ne $ExpectedAssetName)) {
+            throw "Update asset mismatch. Expected '$ExpectedAssetName' but got '$nameToCheck'. Aborting update."
+        }
+    }
+
+    # Stable filename in temp
+    $assetName = if ($ActualAssetName) {
+        $ActualAssetName
+    } elseif ($ExpectedAssetName) {
+        $ExpectedAssetName
+    } else {
+        "Update-$($LatestVersion).exe"
+    }
+
+    $tempPath = Join-Path $env:TEMP $assetName
+
+    # Download
+    try {
+        if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+        Invoke-WebRequest -Uri $InstallerUrl -OutFile $tempPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        throw "Failed to download update installer. $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path $tempPath)) {
+        throw "Update download did not produce a file at $tempPath"
+    }
+
+    # Basic sanity: size threshold
+    $fi = Get-Item $tempPath -ErrorAction Stop
+    if ($fi.Length -lt $MinBytes) {
+        throw "Downloaded installer is unexpectedly small ($($fi.Length) bytes). Aborting update."
+    }
+
+    # Optional integrity: SHA256 match (only if you provide it somewhere)
+    if ($ExpectedSha256) {
+        try {
+            $hash = (Get-FileHash -Path $tempPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        } catch {
+            throw "Failed to compute SHA256 for installer. $($_.Exception.Message)"
+        }
+        if ($hash -ne $ExpectedSha256.ToUpperInvariant()) {
+            throw "Installer SHA256 mismatch. Expected $ExpectedSha256 but got $hash. Aborting update."
+        }
+    }
+
+    # Launch Inno installer silently
+    $args = @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-"
+    ) -join " "
+
+    try {
+        $sp = @{
+            FilePath         = $tempPath
+            ArgumentList     = $args
+            WorkingDirectory = (Split-Path $tempPath)
+        }
+
+        if ($RunAsAdmin) {
+            Start-Process @sp -Verb RunAs | Out-Null
+        } else {
+            Start-Process @sp | Out-Null
+        }
+    } catch {
+        throw "Failed to start installer. $($_.Exception.Message)"
+    }
+
+    return $true
+}
 
 # Expansion + NTFY values from config
 Set-ExpansionUiFromConfig
@@ -1780,6 +2141,93 @@ $BrushLedGray   = New-Object System.Windows.Media.SolidColorBrush ([System.Windo
 $EllipseMySQL.Fill  = $BrushLedGray
 $EllipseAuth.Fill   = $BrushLedGray
 $EllipseWorld.Fill  = $BrushLedGray
+
+# Cache for CPU sampling per role
+if ($null -eq $global:ProcSampleCache) { $global:ProcSampleCache = @{} }
+
+function Get-ProcUtilSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("MySQL","Authserver","Worldserver")]
+        [string]$Role
+    )
+
+    $p = Get-ProcessSafe $Role
+    if ($null -eq $p) {
+        return [pscustomobject]@{
+            CpuPercent   = $null
+            WorkingSetMB = $null
+            PrivateMB    = $null
+        }
+    }
+
+    $now = Get-Date
+    $logical = [Environment]::ProcessorCount
+
+    # Memory snapshot
+    $wsMB = [math]::Round(($p.WorkingSet64 / 1MB), 1)
+    $privMB = $null
+    try { $privMB = [math]::Round(($p.PrivateMemorySize64 / 1MB), 1) } catch { }
+
+    # CPU% via delta sampling
+    $key = $Role
+    $cpuPct = $null
+
+    $curr = [pscustomobject]@{
+        Pid       = $p.Id
+        Timestamp = $now
+        TotalCpu  = $p.TotalProcessorTime
+    }
+
+    if ($global:ProcSampleCache.ContainsKey($key)) {
+        $prev = $global:ProcSampleCache[$key]
+
+        # If PID changed, reset sampling
+        if ($prev.Pid -eq $curr.Pid) {
+            $dt = ($curr.Timestamp - $prev.Timestamp).TotalSeconds
+            if ($dt -gt 0.2) {
+                $dCpu = ($curr.TotalCpu - $prev.TotalCpu).TotalSeconds
+                $cpuPct = [math]::Round((($dCpu / ($dt * $logical)) * 100), 1)
+                if ($cpuPct -lt 0) { $cpuPct = 0 }
+            }
+        }
+    }
+
+    $global:ProcSampleCache[$key] = $curr
+
+    [pscustomobject]@{
+        CpuPercent   = $cpuPct
+        WorkingSetMB = $wsMB
+        PrivateMB    = $privMB
+    }
+}
+
+function Format-CpuText([nullable[double]]$pct) {
+    if ($null -eq $pct) { return "CPU: —" }
+    return ("CPU: {0}%" -f $pct)
+}
+
+function Format-MemText([nullable[double]]$wsMB, [nullable[double]]$privMB) {
+    if ($null -eq $wsMB) { return "RAM: —" }
+    if ($null -ne $privMB) { return ("RAM: {0} MB (Priv {1} MB)" -f $wsMB, $privMB) }
+    return ("RAM: {0} MB" -f $wsMB)
+}
+
+function Update-ResourceUtilizationUi {
+    $uMy = Get-ProcUtilSnapshot -Role "MySQL"
+    $uAu = Get-ProcUtilSnapshot -Role "Authserver"
+    $uWo = Get-ProcUtilSnapshot -Role "Worldserver"
+
+    if ($null -ne $TxtUtilMySQLCpu) { $TxtUtilMySQLCpu.Text = (Format-CpuText $uMy.CpuPercent) }
+    if ($null -ne $TxtUtilMySQLMem) { $TxtUtilMySQLMem.Text = (Format-MemText $uMy.WorkingSetMB $uMy.PrivateMB) }
+
+    if ($null -ne $TxtUtilAuthCpu)  { $TxtUtilAuthCpu.Text  = (Format-CpuText $uAu.CpuPercent) }
+    if ($null -ne $TxtUtilAuthMem)  { $TxtUtilAuthMem.Text  = (Format-MemText $uAu.WorkingSetMB $uAu.PrivateMB) }
+
+    if ($null -ne $TxtUtilWorldCpu) { $TxtUtilWorldCpu.Text = (Format-CpuText $uWo.CpuPercent) }
+    if ($null -ne $TxtUtilWorldMem) { $TxtUtilWorldMem.Text = (Format-MemText $uWo.WorkingSetMB $uWo.PrivateMB) }
+}
+
 
 # -------------------------------------------------
 # NTFY auth header helper
@@ -2386,6 +2834,47 @@ $BtnSaveDbPassword.Add_Click({
     }
 })
 
+$BtnUpdateNow.Add_Click({
+    try {
+        $Owner = "faustus1005"
+        $Repo  = "WoW-Watchdog"
+
+        $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
+        $latestVer = Parse-ReleaseVersion -TagName $rel.tag_name
+
+        $asset = $rel.assets | Where-Object { $_.name -eq "WoWWatchdog-Setup.exe" } | Select-Object -First 1
+        if ($null -eq $asset) {
+            $names = @()
+            if ($rel.assets) { $names = $rel.assets | ForEach-Object { $_.name } }
+            throw ("Could not find 'WoWWatchdog-Setup.exe' in latest release assets. Found: " + ($names -join ", "))
+        }
+
+        # IMPORTANT: use browser_download_url, not asset.url/assets_url
+        $ok = Start-InnoUpdateFromUrl `
+            -InstallerUrl $asset.browser_download_url `
+            -LatestVersion $latestVer `
+            -ExpectedAssetName "WoWWatchdog-Setup.exe"
+
+        if ($ok) {
+            # Close the GUI so the installer can replace files
+            $app = [System.Windows.Application]::Current
+            if ($app -and $app.MainWindow) {
+                $app.MainWindow.Close()
+            } elseif ($app) {
+                $app.Shutdown()
+            }
+        }
+    }
+    catch {
+        [System.Windows.MessageBox]::Show(
+            $_.Exception.Message,
+            "Update Failed",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Error
+        ) | Out-Null
+    }
+})
+
 $BtnMinimize.Add_Click({ $Window.WindowState = 'Minimized' })
 $BtnClose.Add_Click({ $Window.Close() })
 
@@ -2546,6 +3035,8 @@ if ($TxtMySQLExe) { $TxtMySQLExe.Text = [string]$Config.MySQLExe }
 # -------------------------------------------------
 Initialize-NtfyBaseline
 
+if ($null -eq $global:UtilTick) { $global:UtilTick = 0 }
+
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 
@@ -2555,6 +3046,14 @@ $timer.Add_Tick({
         Update-WatchdogStatusLabel
         Update-ServiceStatusLabel
 
+        # Every 5 seconds: Resource utilization snapshot
+        $global:UtilTick++
+        if ($global:UtilTick -ge 5) {
+            $global:UtilTick = 0
+            Update-ResourceUtilizationUi
+        }
+
+        # Log view
         if (Test-Path $LogPath) {
             $text = Get-Content $LogPath -Raw -ErrorAction SilentlyContinue
             if ($text -ne $TxtLiveLog.Text) {
@@ -2566,6 +3065,7 @@ $timer.Add_Tick({
 })
 
 $timer.Start()
+
 
 # -------------------------------------------------
 # Show
