@@ -45,3 +45,10 @@ New Feature:
 - There is now a "Online Players" status in the Main page. This will show either a - (if not configured or DB isn't reachable) or a number indicating the online player count.
 - In the configuration tab mysql.exe location has been added to Server Paths - this is required at current as it relies on the mysql.exe to gather online player information.
 - Database settings, host, user, password, port, DB name, a test DB button, and save DB password button.
+
+## v1.1.8 – Feature Release
+- The status info now contains CPU/Memory usage snapshot info. 5s update tick
+- Two new tabs have been added: Tools and Updates
+  - Tools is currently empty, but will contain useful tools in the next release.
+- Updates tab now can check for, and update to the latest GitHub release.
+  - Updating will stop the Watchdog. Keep that in mind before running an update.
