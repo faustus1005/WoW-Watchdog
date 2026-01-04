@@ -85,7 +85,7 @@ function Write-JsonFile {
     $Object | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
-$AppVersion = [version]"1.1.8"
+$AppVersion = [version]"1.1.9"
 $RepoOwner  = "FAUSTUS1005"
 $RepoName   = "WoW-Watchdog"
 
