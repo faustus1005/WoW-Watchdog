@@ -448,24 +448,6 @@ function Get-OnlinePlayerCountCached_Legion {
     return [int]$val
 }
 
-function Get-LatestGitHubRelease {
-    param(
-        [Parameter(Mandatory)][string]$Owner,
-        [Parameter(Mandatory)][string]$Repo
-    )
-
-    $uri = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
-    $headers = @{
-        "User-Agent" = "WoWWatchdog"
-        "Accept"     = "application/vnd.github+json"
-    }
-
-    # If rate limited enable
-    # $headers["Authorization"] = "Bearer $($env:GITHUB_TOKEN)"
-
-    return Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-}
-
 function Parse-ReleaseVersion {
     param([string]$TagName)
 
@@ -1883,12 +1865,13 @@ $TxtDbPassword    = $Window.FindName("TxtDbPassword")
 $BtnSaveDbPassword= $Window.FindName("BtnSaveDbPassword")
 $BtnTestDb        = $Window.FindName("BtnTestDb")
 
-$TxtUtilMySQLCpu  = $Window.FindName("TxtUtilMySQLCpu")
-$TxtUtilMySQLMem  = $Window.FindName("TxtUtilMySQLMem")
-$TxtUtilAuthCpu   = $Window.FindName("TxtUtilAuthCpu")
-$TxtUtilAuthMem   = $Window.FindName("TxtUtilAuthMem")
-$TxtUtilWorldCpu  = $Window.FindName("TxtUtilWorldCpu")
-$TxtUtilWorldMem  = $Window.FindName("TxtUtilWorldMem")
+$TxtUtilMySQLCpu  = Assert-Control $Window "TxtUtilMySQLCpu"
+$TxtUtilMySQLMem  = Assert-Control $Window "TxtUtilMySQLMem"
+$TxtUtilAuthCpu   = Assert-Control $Window "TxtUtilAuthCpu"
+$TxtUtilAuthMem   = Assert-Control $Window "TxtUtilAuthMem"
+$TxtUtilWorldCpu  = Assert-Control $Window "TxtUtilWorldCpu"
+$TxtUtilWorldMem  = Assert-Control $Window "TxtUtilWorldMem"
+$TxtWorldUptime   = Assert-Control $Window "TxtWorldUptime"
 
 # Tab: Update
 $TxtCurrentVersion = $Window.FindName("TxtCurrentVersion")
@@ -2447,9 +2430,7 @@ function Format-Uptime {
 
 function Update-WorldUptimeLabel {
     try {
-        # If your exe name differs, adjust this (no .exe needed)
-        $p = Get-Process -Name "worldserver" -ErrorAction SilentlyContinue | Select-Object -First 1
-
+        $p = Get-ProcessSafe "Worldserver"
         if ($null -eq $p) {
             $TxtWorldUptime.Text = "Stopped"
             return
@@ -2458,10 +2439,10 @@ function Update-WorldUptimeLabel {
         $uptime = (Get-Date) - $p.StartTime
         $TxtWorldUptime.Text = (Format-Uptime -Span $uptime)
     } catch {
-        # StartTime can throw if access is denied or process exits mid-read
         $TxtWorldUptime.Text = "—"
     }
 }
+
 
 function Update-ResourceUtilizationUi {
     $uMy = Get-ProcUtilSnapshot -Role "MySQL"
@@ -2665,16 +2646,13 @@ function Get-ProcessSafe {
 
     foreach ($name in $ProcessAliases[$Role]) {
         try {
-            $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
-            if ($proc) {
-                return $proc
-            }
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($proc) { return $proc }
         } catch { }
     }
 
     return $null
 }
-
 
 # -------------------------------------------------
 # Watchdog process state + NTFY
@@ -3339,7 +3317,9 @@ $timer.Add_Tick({
                 $TxtLiveLog.ScrollToEnd()
             }
         }
-    } catch { }
+     } catch {
+        Add-GuiLog "TIMER ERROR: $($_.Exception.Message)"
+    }
 })
 
 $timer.Start()
