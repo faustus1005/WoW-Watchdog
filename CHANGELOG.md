@@ -52,3 +52,9 @@ New Feature:
   - Tools is currently empty, but will contain useful tools in the next release.
 - Updates tab now can check for, and update to the latest GitHub release.
   - Updating will stop the Watchdog. Keep that in mind before running an update.
+  
+## v1.1.9 – Feature Release
+- Tools tab now handled skeezerbean's SPP V2 Legion Management app
+ - App will be installed in %appdata%\wowwatchdog if it doesn't already exist there.
+ - Once installed, you should use the update feature in the management app, my launcher will *not* update it.
+ - If you already use the app, copy your config into the new folder so the launcher installed version has that data. (I may do some form of ingest for this down the road.)

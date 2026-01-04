@@ -469,45 +469,175 @@ function Get-LatestGitHubRelease {
 function Parse-ReleaseVersion {
     param([string]$TagName)
 
-    # Normalize null / empty
     $t = ""
-    if ($TagName) {
-        $t = $TagName.Trim()
-    }
-
-    # Supports tags like "v1.2.3" or "1.2.3"
-    if ($t.StartsWith("v")) {
-        $t = $t.Substring(1)
-    }
-
-    return [version]$t
+    if ($TagName) { $t = $TagName.Trim() }
+    if ($t.StartsWith("v")) { $t = $t.Substring(1) }
+    [version]$t
 }
 
-function Get-LatestInstallerAsset {
+function Get-WoWWatchdogDataFolder {
+    if ($global:WoWWatchdogDataDir -and (Test-Path $global:WoWWatchdogDataDir)) {
+        return $global:WoWWatchdogDataDir
+    }
+
+    $base = Join-Path $env:APPDATA "WoWWatchdog"
+    $data = Join-Path $base "data"
+    if (-not (Test-Path $data)) { New-Item -ItemType Directory -Path $data -Force | Out-Null }
+    $data
+}
+
+function Get-LatestReleaseAssetInfo {
     param(
         [Parameter(Mandatory)][string]$Owner,
         [Parameter(Mandatory)][string]$Repo,
-        [string]$ExpectedAssetName = "WoWWatchdog-Setup.exe"
+
+        # Use ONE of these:
+        [string]$ExpectedAssetName,
+        [string]$AssetNameRegex
     )
 
     $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
 
     if (-not $rel.assets -or $rel.assets.Count -lt 1) {
-        throw "Latest release '$($rel.tag_name)' has no assets. Upload the installer EXE to the release."
+        throw "Latest release '$($rel.tag_name)' has no assets."
     }
 
-    $asset = $rel.assets | Where-Object { $_.name -eq $ExpectedAssetName } | Select-Object -First 1
-    if (-not $asset) {
-        $names = ($rel.assets | ForEach-Object { $_.name }) -join ", "
-        throw "Could not find expected asset '$ExpectedAssetName' in latest release assets: $names"
+    $asset = $null
+
+    if ($ExpectedAssetName) {
+        $asset = $rel.assets | Where-Object { $_.name -eq $ExpectedAssetName } | Select-Object -First 1
+        if (-not $asset) {
+            $names = ($rel.assets | ForEach-Object { $_.name }) -join ", "
+            throw "Could not find expected asset '$ExpectedAssetName' in latest release assets: $names"
+        }
+    }
+    elseif ($AssetNameRegex) {
+        $asset = $rel.assets | Where-Object { $_.name -match $AssetNameRegex } | Select-Object -First 1
+        if (-not $asset) {
+            $names = ($rel.assets | ForEach-Object { $_.name }) -join ", "
+            throw "Could not find an asset matching regex '$AssetNameRegex' in: $names"
+        }
+    }
+    else {
+        throw "Provide either -ExpectedAssetName or -AssetNameRegex."
     }
 
-    return [pscustomobject]@{
-        LatestVersion       = (Parse-ReleaseVersion -TagName $rel.tag_name)
-        InstallerUrl        = $asset.browser_download_url   # IMPORTANT
-        AssetName           = $asset.name
-        ReleaseTag          = $rel.tag_name
+    [pscustomobject]@{
+        Release          = $rel
+        Tag              = $rel.tag_name
+        LatestVersion    = (Parse-ReleaseVersion -TagName $rel.tag_name)
+        AssetName        = $asset.name
+        DownloadUrl      = $asset.browser_download_url
     }
+}
+function Get-LatestGitHubRelease {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo
+    )
+
+    # PS 5.1: ensure TLS 1.2
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    $uri = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
+    $headers = @{
+        "User-Agent" = "WoWWatchdog"
+        "Accept"     = "application/vnd.github+json"
+    }
+
+    Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+}
+
+function Expand-ZipSafe {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    if (-not (Test-Path $Destination)) {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    }
+
+    Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+}
+
+function Get-FirstExeInFolder {
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [string]$ExeNameHintRegex = 'SPP|Legion|Manager|Management'
+    )
+
+    if (-not (Test-Path $Folder)) { return $null }
+
+    $all = Get-ChildItem -Path $Folder -Filter *.exe -Recurse -File -ErrorAction SilentlyContinue
+    if (-not $all) { return $null }
+
+    $hint = $all | Where-Object { $_.Name -match $ExeNameHintRegex } | Select-Object -First 1
+    if ($hint) { return $hint.FullName }
+
+    ($all | Select-Object -First 1).FullName
+}
+
+function Ensure-GitHubZipToolInstalled {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$InstallDir,
+
+        # Strongly recommended if you know it:
+        [string]$ExeRelativePath,
+
+        # Asset selection (regex)
+        [Parameter(Mandatory)][string]$AssetNameRegex
+    )
+
+    if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
+
+    # If caller provided an exact EXE path, honor it first
+    if ($ExeRelativePath) {
+        $exePath = Join-Path $InstallDir $ExeRelativePath
+        if (Test-Path $exePath) { return $exePath }
+    }
+
+    # Otherwise, if anything is already installed, use it
+    $existingExe = Get-FirstExeInFolder -Folder $InstallDir
+    if ($existingExe) { return $existingExe }
+
+    # Pull latest release + matching zip asset
+    $info = Get-LatestReleaseAssetInfo -Owner $Owner -Repo $Repo -AssetNameRegex $AssetNameRegex
+
+    $tempZip = Join-Path $env:TEMP $info.AssetName
+
+    try {
+        if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
+        Invoke-WebRequest -Uri $info.DownloadUrl -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
+    } catch {
+        throw "Failed to download tool from GitHub. $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path $tempZip)) {
+        throw "Download did not produce a file at: $tempZip"
+    }
+
+    try {
+        Expand-ZipSafe -ZipPath $tempZip -Destination $InstallDir
+    } catch {
+        throw "Failed to extract archive '$($info.AssetName)' to '$InstallDir'. $($_.Exception.Message)"
+    }
+
+    # Resolve exe after extraction
+    if ($ExeRelativePath) {
+        $exePath = Join-Path $InstallDir $ExeRelativePath
+        if (Test-Path $exePath) { return $exePath }
+        throw "Install completed, but expected EXE was not found: $exePath"
+    }
+
+    $exeFound = Get-FirstExeInFolder -Folder $InstallDir
+    if (-not $exeFound) {
+        throw "Install completed, but no EXE was found under: $InstallDir"
+    }
+
+    $exeFound
 }
 
 # -------------------------------------------------
@@ -839,11 +969,12 @@ $xaml = @"
 
           <Grid Margin="10">
             <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/> <!-- Watchdog -->
-              <RowDefinition Height="Auto"/> <!-- Service -->
-              <RowDefinition Height="Auto"/> <!-- LEDs -->
-              <RowDefinition Height="Auto"/> <!-- Online players -->
-              <RowDefinition Height="Auto"/> <!-- Resource utilization (NEW) -->
+            <RowDefinition Height="Auto"/> <!-- Watchdog -->
+            <RowDefinition Height="Auto"/> <!-- Service -->
+            <RowDefinition Height="Auto"/> <!-- LEDs -->
+            <RowDefinition Height="Auto"/> <!-- Online players -->
+            <RowDefinition Height="Auto"/> <!-- Resource utilization -->
+            <RowDefinition Height="Auto"/> <!-- World uptime (NEW) -->
             </Grid.RowDefinitions>
 
             <WrapPanel Grid.Row="0" Margin="0,0,0,6">
@@ -927,6 +1058,14 @@ $xaml = @"
             <TextBlock Grid.Row="3" Grid.Column="2" x:Name="TxtUtilWorldMem" Text="RAM: —" Foreground="White"/>
             </Grid>
 
+            <!-- World Uptime -->
+            <WrapPanel Grid.Row="5" Margin="0,10,0,0">
+            <TextBlock Text="World Uptime:" Foreground="#FF86B5E5" Margin="0,0,6,0"/>
+            <TextBlock x:Name="TxtWorldUptime"
+                        Text="—"
+                        FontWeight="SemiBold"
+                        Foreground="White"/>
+            </WrapPanel>
           </Grid>
         </GroupBox>
 
@@ -1358,19 +1497,73 @@ $xaml = @"
     </ScrollViewer>
   </TabItem>
 
- <!-- ================================================= -->
-  <!-- TAB 3: Tools (EMPTY FOR NOW)                      -->
+  <!-- ================================================= -->
+  <!-- TAB 3: Tools                                      -->
   <!-- ================================================= -->
   <TabItem Header="Tools">
-    <Grid Margin="12">
-      <TextBlock Text="Tools"
-                 FontSize="16"
-                 FontWeight="SemiBold"
-                 Foreground="#FFBDDCFF"
-                 Margin="0,0,0,8"/>
+  <Grid Margin="12">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>  <!-- Header -->
+      <RowDefinition Height="Auto"/>  <!-- Buttons / tools -->
+      <RowDefinition Height="*"/>     <!-- Future content -->
+    </Grid.RowDefinitions>
 
-      <TextBlock Text="Future utilities and diagnostics will appear here."
-                 Foreground="#FF86B5E5"/>
+        <!-- Tools tab content -->
+        <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <GroupBox Grid.Row="1" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+            <GroupBox.Header>
+            <TextBlock Text="Launchers"
+                        Foreground="#FFBDDCFF"
+                        FontWeight="SemiBold"/>
+            </GroupBox.Header>
+            <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Color="#FF151B28" Offset="0.0"/>
+                <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+            </GroupBox.Background>
+
+            <Grid Margin="10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Button x:Name="BtnLaunchSppManager"
+                    Grid.Column="0"
+                    Content="SPP Legion V2 Manager"
+                    MinWidth="220"
+                    Height="40"
+                    Background="#FF3478BF"
+                    Foreground="White"
+                    BorderBrush="#FF2B5E9A"
+                    BorderThickness="1"
+                    Margin="0,0,12,0"/>
+
+        <TextBlock Grid.Column="1"
+           TextWrapping="Wrap"
+           Foreground="#FF86B5E5"
+           VerticalAlignment="Center">
+            <Hyperlink NavigateUri="https://github.com/skeezerbean">
+            The latest release will be downloaded and launched. Credit to Skeezerbean.
+            </Hyperlink>
+        </TextBlock>
+
+            </Grid>
+        </GroupBox>
+
+        <!-- Optional: status text -->
+        <TextBlock Grid.Row="2"
+                    x:Name="TxtToolsStatus"
+                    Foreground="#FF86B5E5"
+                    TextWrapping="Wrap"/>
+        </Grid>
     </Grid>
   </TabItem>
 
@@ -1562,6 +1755,23 @@ try {
     return
 }
 
+$Window.AddHandler(
+    [System.Windows.Documents.Hyperlink]::RequestNavigateEvent,
+    [System.Windows.Navigation.RequestNavigateEventHandler]{
+        param($sender, $e)
+
+        try {
+            Start-Process $e.Uri.AbsoluteUri
+            $e.Handled = $true
+        } catch {
+            [System.Windows.MessageBox]::Show(
+                "Failed to open link: $($e.Uri.AbsoluteUri)`n$($_.Exception.Message)",
+                "Link Error", "OK", "Error"
+            ) | Out-Null
+        }
+    }
+)
+
 # -------------------------------------------------
 # Apply program icon
 # -------------------------------------------------
@@ -1582,6 +1792,18 @@ $Window.Add_MouseLeftButtonDown({
         $Window.DragMove()
     }
 })
+
+function Assert-Control {
+    param(
+        [Parameter(Mandatory)]$Window,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $c = $Window.FindName($Name)
+    if ($null -eq $c) { throw "Missing XAML control: $Name" }
+    return $c
+}
+
+$BtnLaunchSppManager = Assert-Control -Window $Window -Name "BtnLaunchSppManager"
 
 # -------------------------------------------------
 # Get controls
@@ -1674,6 +1896,8 @@ $TxtLatestVersion  = $Window.FindName("TxtLatestVersion")
 $BtnCheckUpdates   = $Window.FindName("BtnCheckUpdates")
 $BtnUpdateNow      = $Window.FindName("BtnUpdateNow")
 
+$BtnLaunchSppManager = $Window.FindName("BtnLaunchSppManager")
+
 $TxtCurrentVersion.Text = $AppVersion.ToString()
 
 function Update-UpdateIndicator {
@@ -1702,7 +1926,6 @@ function Update-UpdateIndicator {
 }
 
 $BtnCheckUpdates.Add_Click({ Update-UpdateIndicator })
-
 
 # Tab 1: Server Info
 $TxtOnlinePlayers = $Window.FindName("TxtOnlinePlayers")
@@ -2211,6 +2434,33 @@ function Format-MemText([nullable[double]]$wsMB, [nullable[double]]$privMB) {
     if ($null -eq $wsMB) { return "RAM: —" }
     if ($null -ne $privMB) { return ("RAM: {0} MB (Priv {1} MB)" -f $wsMB, $privMB) }
     return ("RAM: {0} MB" -f $wsMB)
+}
+
+function Format-Uptime {
+    param([TimeSpan]$Span)
+    # d.hh:mm:ss (only show days if > 0)
+    if ($Span.TotalDays -ge 1) {
+        return ("{0}d {1:00}:{2:00}:{3:00}" -f [int]$Span.TotalDays, $Span.Hours, $Span.Minutes, $Span.Seconds)
+    }
+    return ("{0:00}:{1:00}:{2:00}" -f $Span.Hours, $Span.Minutes, $Span.Seconds)
+}
+
+function Update-WorldUptimeLabel {
+    try {
+        # If your exe name differs, adjust this (no .exe needed)
+        $p = Get-Process -Name "worldserver" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if ($null -eq $p) {
+            $TxtWorldUptime.Text = "Stopped"
+            return
+        }
+
+        $uptime = (Get-Date) - $p.StartTime
+        $TxtWorldUptime.Text = (Format-Uptime -Span $uptime)
+    } catch {
+        # StartTime can throw if access is denied or process exits mid-read
+        $TxtWorldUptime.Text = "—"
+    }
 }
 
 function Update-ResourceUtilizationUi {
@@ -3030,6 +3280,33 @@ $BtnBrowseMySQLExe.Add_Click({
 })
 if ($TxtMySQLExe) { $TxtMySQLExe.Text = [string]$Config.MySQLExe }
 
+$BtnLaunchSppManager.Add_Click({
+    try {
+        $owner = "skeezerbean"
+        $repo  = "SPP-LegionV2-Management"
+
+        $dataRoot   = Get-WoWWatchdogDataFolder
+        $installDir = Join-Path $dataRoot "SPP-LegionV2-Management"
+
+        # Matches: SPP.LegionV2.Management.0.0.2.24.zip
+        $assetRegex = '^SPP\.LegionV2\.Management\.\d+\.\d+\.\d+\.\d+\.zip$'
+
+        # Confirmed extracted EXE location:
+        $exeRel = 'SPP LegionV2 Management\SPP-LegionV2-Management.exe'
+
+        $exePath = Ensure-GitHubZipToolInstalled `
+            -Owner $owner `
+            -Repo $repo `
+            -InstallDir $installDir `
+            -ExeRelativePath $exeRel `
+            -AssetNameRegex $assetRegex
+
+        Start-Process -FilePath $exePath -WorkingDirectory (Split-Path $exePath) | Out-Null
+    } catch {
+        [System.Windows.MessageBox]::Show($_.Exception.Message, "Launch Failed", "OK", "Error") | Out-Null
+    }
+})
+
 # -------------------------------------------------
 # Timer – update status + log view
 # -------------------------------------------------
@@ -3045,6 +3322,7 @@ $timer.Add_Tick({
         Update-ServiceStates
         Update-WatchdogStatusLabel
         Update-ServiceStatusLabel
+        Update-WorldUptimeLabel
 
         # Every 5 seconds: Resource utilization snapshot
         $global:UtilTick++
