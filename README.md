@@ -1,3 +1,5 @@
+# <p align="center">NOTE: The app update process has a bug in the current release. During the next update, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
+
 # <p align="center">🛡️ WoW-Watchdog</p>
 
 <p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
