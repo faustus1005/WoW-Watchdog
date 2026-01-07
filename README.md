@@ -1,11 +1,15 @@
+# <p align="center">NOTE: The app update process has a bug in the current release. During the next update, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
+
 # <p align="center">🛡️ WoW-Watchdog</p>
 
 <p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
 <p align="center">Your ultimate companion for monitoring World of Warcraft private servers.</p>
 
-![screen](https://github.com/user-attachments/assets/d5133eef-e738-425a-a967-a8c347a719c9)
-![screen2](https://github.com/user-attachments/assets/0338bb5f-674a-4a09-a9ea-e95768789414)
+![Main](https://github.com/user-attachments/assets/f5f96c70-2c10-4ce2-8480-8cdd73ba2a37)
+![config](https://github.com/user-attachments/assets/e399a623-76a7-439e-9ad8-ac1d07e2be8c)
+![tools](https://github.com/user-attachments/assets/15550cf6-419f-4ca7-bab9-877dd28a630d)
+![update](https://github.com/user-attachments/assets/4bed4379-6d80-4d09-b833-fc60d05ff320)
 
 ## 📖 Overview
 
@@ -15,13 +19,17 @@ This tool runs quietly in the background, periodically checking specified server
 
 ## ✨ Features
 
-*   📡 **Server Status Checks**: Accurately detect if a server is online or offline.
+*  **Server Status Checks**: Accurately detect if a server is online or offline.
     
-*   🔔 **Configurable Notifications**: Receive alerts for server status changes.
+*  **Configurable Notifications**: Receive alerts for server status changes.
+
+*  **Self Updater**: App can update itself from the latest release.
+
+*  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
     
-*   💾 **JSON-based Configuration**: Easy and flexible setup using a human-readable `config.json` file.
+*  **JSON-based Configuration**: Easy and flexible setup using a human-readable `config.json` file.
     
-*   📦 **Easy Use**: Designed for easy deployment and setup.
+*  **Easy Use**: Designed for easy deployment and setup.
     
 
 ## 🛠️ Tech Stack
