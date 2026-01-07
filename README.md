@@ -17,6 +17,8 @@ WoW-Watchdog is a robust PowerShell-based application designed to monitor the st
 
 This tool runs quietly in the background, periodically checking specified servers and alerting you to changes such as a server going offline, or optionally, when the server is back online.
 
+It is geared mostly towards the SPP Legion Repack, so many of the features will not work with other repacks without modification, but the core feature of starting/stopping/notifying should work for most WoW Private servers.
+
 ## ✨ Features
 
 *  **Server Status Checks**: Accurately detect if a server is online or offline.
