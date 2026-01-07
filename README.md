@@ -2,11 +2,6 @@
 
 <p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
-![Main](https://github.com/user-attachments/assets/f5f96c70-2c10-4ce2-8480-8cdd73ba2a37)
-![config](https://github.com/user-attachments/assets/e399a623-76a7-439e-9ad8-ac1d07e2be8c)
-![tools](https://github.com/user-attachments/assets/80096c32-ac6a-4e25-ae2a-c27f0162a1c6)
-![update](https://github.com/user-attachments/assets/4bed4379-6d80-4d09-b833-fc60d05ff320)
-
 ## 📖 Overview
 
 WoW-Watchdog is a robust PowerShell-based application designed to monitor the status of your favorite World of Warcraft private servers. WoW-Watchdog provides timely notifications, ensuring you're always informed using NTFY integration.
@@ -34,7 +29,11 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
 *  **JSON-based Configuration**: Easy and flexible setup using a human-readable `config.json` file.
     
 *  **Easy Use**: Designed for easy deployment and setup.
-    
+
+![Main](https://github.com/user-attachments/assets/f5f96c70-2c10-4ce2-8480-8cdd73ba2a37)
+![config](https://github.com/user-attachments/assets/e399a623-76a7-439e-9ad8-ac1d07e2be8c)
+![tools](https://github.com/user-attachments/assets/80096c32-ac6a-4e25-ae2a-c27f0162a1c6)
+![update](https://github.com/user-attachments/assets/4bed4379-6d80-4d09-b833-fc60d05ff320)
 
 ## 🛠️ Tech Stack
 
