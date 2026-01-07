@@ -72,3 +72,11 @@ New Feature:
 
 Bug fixes:
 - Graceful shutdown of services is now maintained when using the self-update feature.
+
+ ## v1.2.1 – Minor Release
+- Server/Repack Full Backup functionality added.
+  - Graceful stop of World->Auth->DB
+  - Zip entire repack folder (specified in Repack Folder text box or browse button)
+  - Once zip completed, attempt restart services. DB->Auth->World
+- Option to back up just the auth/world config files.
+
