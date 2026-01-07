@@ -1,7 +1,5 @@
 # <p align="center">🛡️ WoW-Watchdog</p>
 
-# <p align="center">NOTE: The app update process has a bug in the v1.1.9 release. Before updating, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
-
 <p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
 <p align="center">Your ultimate companion for monitoring World of Warcraft private servers.</p>
@@ -25,7 +23,7 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
     
 *  **Configurable Notifications**: Receive alerts for server status changes.
 
-*  **Self Updater**: App can update itself from the latest release.
+*  **Self Updater**: App can update itself from the latest release. (Current bug to be fixed in next release. Please update manually until v1.2.2)
 
 *  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
 
