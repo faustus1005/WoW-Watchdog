@@ -1,4 +1,4 @@
-# <p align="center">NOTE: The app update process has a bug in the v1.1.9 release. Before updating to v1.2.0, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
+# <p align="center">NOTE: The app update process has a bug in the v1.1.9 release. Before updating, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
 
 # <p align="center">🛡️ WoW-Watchdog</p>
 
@@ -30,6 +30,8 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
 *  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
 
 *  **Database**: Backup and Restore Management
+
+*  **Backups**: Create backups of the entire server/repack folder, or just auth/world config files.
 
 *  **Tools**: SPP V2 Management Tool and BattlePay Editor download/install/launch
     
