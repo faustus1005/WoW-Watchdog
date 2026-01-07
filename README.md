@@ -2,8 +2,6 @@
 
 <p align="center"> <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&style=flat-square"/> <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey?logo=windows&style=flat-square"/> <img src="https://img.shields.io/badge/Service-NSSM-success?style=flat-square"/> <img src="https://img.shields.io/badge/GUI-WPF-blueviolet?style=flat-square"/> <img src="https://img.shields.io/badge/Notifications-NTFY-orange?style=flat-square"/> <img src="https://img.shields.io/badge/Status-Stable-success?style=flat-square"/> </p>
 
-<p align="center">Your ultimate companion for monitoring World of Warcraft private servers.</p>
-
 ![Main](https://github.com/user-attachments/assets/f5f96c70-2c10-4ce2-8480-8cdd73ba2a37)
 ![config](https://github.com/user-attachments/assets/e399a623-76a7-439e-9ad8-ac1d07e2be8c)
 ![tools](https://github.com/user-attachments/assets/80096c32-ac6a-4e25-ae2a-c27f0162a1c6)
