@@ -51,6 +51,85 @@ trap {
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+
+function Pick-Folder {
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = "Select a folder"
+    $dlg.ShowNewFolderButton = $true
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        return $dlg.SelectedPath
+    }
+    return $null
+}
+
+function Get-AccessibleDatabases {
+    param(
+        [Parameter(Mandatory)][string]$MySqlExePath,
+        [Parameter(Mandatory)][string]$DbHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$User,
+        [Parameter()][pscredential]$Credential,
+        [Parameter(Mandatory)][string[]]$Candidates
+    )
+
+    if (-not (Test-Path -LiteralPath $MySqlExePath)) { throw "mysql.exe not found: $MySqlExePath" }
+    if (-not $Candidates -or $Candidates.Count -lt 1) { return @() }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $MySqlExePath
+
+    # No password in args; query lists visible DBs for this login
+    $argsList = @(
+        "--host=$DbHost",
+        "--port=$Port",
+        "--user=$User",
+        "--batch",
+        "--skip-column-names",
+        "-e",
+        "SHOW DATABASES;"
+    )
+    $psi.Arguments = ($argsList -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow = $true
+
+    $pwdPtr = [IntPtr]::Zero
+    try {
+        if ($Credential -and $Credential.Password) {
+            $pwdPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtr)
+            if (-not [string]::IsNullOrWhiteSpace($plainPwd)) {
+                $psi.EnvironmentVariables["MYSQL_PWD"] = $plainPwd
+            }
+        }
+
+        $p = [Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+
+        if ($p.ExitCode -ne 0) {
+            throw ("Failed to enumerate databases (exit {0}): {1}" -f $p.ExitCode, ($err.Trim()))
+        }
+
+        $visible = $out -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        # Intersect candidates with what this user can see
+        $setVisible = [System.Collections.Generic.HashSet[string]]::new([string[]]$visible, [StringComparer]::OrdinalIgnoreCase)
+
+        $allowed = foreach ($c in $Candidates) {
+            $name = $c.Trim()
+            if ($name -and $setVisible.Contains($name)) { $name }
+        }
+
+        return @($allowed)
+    }
+    finally {
+        if ($pwdPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtr) }
+        Remove-Variable plainPwd -ErrorAction SilentlyContinue
+    }
+}
 
 # -------------------------------------------------
 # JSON helpers
@@ -85,7 +164,7 @@ function Write-JsonFile {
     $Object | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
-$AppVersion = [version]"1.1.9"
+$AppVersion = [version]"1.2.0"
 $RepoOwner  = "FAUSTUS1005"
 $RepoName   = "WoW-Watchdog"
 
@@ -99,9 +178,18 @@ $ExePath     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.File
 $InstallDir  = Split-Path -Parent $ExePath
 $ScriptDir   = $InstallDir
 
+
+$script:ScriptDir = $ScriptDir
 $DataDir     = Join-Path $env:ProgramData $AppName
-if (-not (Test-Path $DataDir)) {
+if (-not (Test-Path -LiteralPath $DataDir)) {
     New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
+}
+
+# Tools downloaded/installed by launchers MUST be writable without elevation.
+# Use ProgramData\WoWWatchdog\Tools (installer grants users-modify on the WoWWatchdog folder).
+$script:ToolsDir = Join-Path $DataDir "Tools"
+if (-not (Test-Path -LiteralPath $script:ToolsDir)) {
+    New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null
 }
 
 $ConfigPath     = Join-Path $DataDir "config.json"
@@ -200,6 +288,57 @@ Ensure-ConfigSchema -Cfg $Config -Defaults ([pscustomobject]$DefaultConfig)
 # Persist upgraded config immediately
 Write-JsonFile -Path $ConfigPath -Object $Config
 
+function Ensure-UrlZipToolInstalled {
+    param(
+        [Parameter(Mandatory)][string]$ZipUrl,
+        [Parameter(Mandatory)][string]$InstallDir,
+
+        # Exact expected EXE location after extraction (relative to InstallDir)
+        [Parameter(Mandatory)][string]$ExeRelativePath,
+
+        # Optional: for nicer temp naming/logging
+        [string]$ToolName = "Tool",
+        [string]$TempZipFileName = "tool.zip"
+    )
+
+    if (-not (Test-Path $InstallDir)) {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    }
+
+    $exePath = Join-Path $InstallDir $ExeRelativePath
+    if (Test-Path $exePath) { return $exePath }
+
+    # PS 5.1: ensure TLS 1.2
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    $tempZip = Join-Path $env:TEMP $TempZipFileName
+
+    try {
+        if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
+
+        # UseBasicParsing for PS 5.1
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
+    } catch {
+        throw "Failed to download $ToolName from URL. $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path $tempZip)) {
+        throw "Download did not produce a file at: $tempZip"
+    }
+
+    try {
+        Expand-ZipSafe -ZipPath $tempZip -Destination $InstallDir
+    } catch {
+        throw "Failed to extract $ToolName archive to '$InstallDir'. $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path $exePath)) {
+        throw "$ToolName install completed, but expected EXE was not found: $exePath"
+    }
+
+    return $exePath
+}
+
 # -------------------------------------------------
 # DPAPI Secrets Store
 # -------------------------------------------------
@@ -257,21 +396,30 @@ function Unprotect-Secret {
 }
 
 function Get-NtfySecretKey {
-    param([Parameter(Mandatory)][ValidateSet("BasicPassword","Token")][string]$Kind)
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("BasicPassword","Token")]
+        [string]$Kind
+    )
 
-    $server = ""
-    $topic  = ""
+    # Prefer current UI values, but fall back to persisted config values (important during startup/load).
+    $server = $null
+    $topic  = $null
+
     try { $server = [string]$TxtNtfyServer.Text } catch { }
     try { $topic  = [string]$TxtNtfyTopic.Text } catch { }
 
-    $server = ($server.Trim()).TrimEnd('/')
-    $topic  = ($topic.Trim()).Trim('/')
+    if ([string]::IsNullOrWhiteSpace($server)) { $server = [string]$Config.NtfyServer }
+    if ([string]::IsNullOrWhiteSpace($topic))  { $topic  = [string]$Config.NtfyTopic  }
 
-    if ([string]::IsNullOrWhiteSpace($server) -or [string]::IsNullOrWhiteSpace($topic)) {
-        return "NTFY::$Kind"
-    }
+    # PowerShell 5.1-safe null handling and normalization
+    if ($null -eq $server) { $server = "" }
+    if ($null -eq $topic)  { $topic  = "" }
 
-    return "NTFY::$Kind::$server/$topic"
+    $server = $server.Trim()
+    $topic  = $topic.Trim()
+
+    return ("NTFY::{0}::{1}@{2}" -f $Kind, $server, $topic)
 }
 
 function Set-NtfySecret {
@@ -530,18 +678,112 @@ function Get-LatestGitHubRelease {
     Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
 }
 
+function Get-7ZipCliPath {
+    param(
+        # AppRoot defaults to the installed app folder (where WoWWatcher.exe lives)
+        [string]$AppRoot = $script:ScriptDir,
+
+        # Optional: also look in ProgramData tools deps if you choose to place it there
+        [string]$DataToolsDir = $script:ToolsDir
+    )
+
+    $candidates = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($AppRoot)) {
+        $candidates += @(
+            (Join-Path $AppRoot "Tools\_deps\7zip\7za.exe"),
+            (Join-Path $AppRoot "Tools\_deps\7zip\7z.exe")
+        )
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($DataToolsDir)) {
+        $candidates += @(
+            (Join-Path $DataToolsDir "_deps\7zip\7za.exe"),
+            (Join-Path $DataToolsDir "_deps\7zip\7z.exe")
+        )
+    }
+
+    $candidates += @(
+        (Join-Path $env:ProgramFiles "7-Zip\7z.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.exe")
+    )
+
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+    }
+
+    return $null
+}
+
+function Expand-ArchiveWith7Zip {
+    param(
+        [Parameter(Mandatory)][string]$SevenZipExe,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SevenZipExe)) {
+        throw "7-Zip CLI not found at: $SevenZipExe"
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Archive not found at: $Path"
+    }
+    if (-not (Test-Path -LiteralPath $DestinationPath)) {
+        New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+    }
+
+    # IMPORTANT: Use the call operator (&) to preserve arguments containing spaces (e.g., Program Files paths).
+    $args = @(
+        "x",                 # extract with full paths
+        "-y",                # assume yes
+        "-aoa",              # overwrite all
+        "-o$DestinationPath",
+        $Path
+    )
+
+    $out = & $SevenZipExe @args 2>&1
+    $code = $LASTEXITCODE
+
+    # 7-Zip exit codes: 0 = OK, 1 = Warnings, 2+ = Fatal errors
+    if ($code -gt 1) {
+        $msg = ($out | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "(no output)" }
+        throw "7-Zip extraction failed (exit code $code). Output:`n$msg"
+    }
+}
+
 function Expand-ZipSafe {
     param(
         [Parameter(Mandatory)][string]$ZipPath,
         [Parameter(Mandatory)][string]$Destination
     )
 
-    if (-not (Test-Path $Destination)) {
+    if ([string]::IsNullOrWhiteSpace($ZipPath))     { throw "Expand-ZipSafe: ZipPath is empty." }
+    if ([string]::IsNullOrWhiteSpace($Destination)) { throw "Expand-ZipSafe: Destination is empty." }
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+        throw "Expand-ZipSafe: Archive not found: $ZipPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
         New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     }
 
-    Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    try {
+        # Built-in ZIP extraction (works for standard ZIP methods only)
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
+    }
+    catch {
+        # Non-standard ZIP methods / .7z: fallback to 7-Zip CLI
+        $sevenZip = Get-7ZipCliPath
+        if (-not $sevenZip) {
+            throw "Extraction requires 7-Zip CLI, but it was not found. Bundle 7za.exe under '{app}\Tools\_deps\7zip\7za.exe' (recommended) or install 7-Zip system-wide."
+        }
+
+        Expand-ArchiveWith7Zip -SevenZipExe $sevenZip -Path $ZipPath -DestinationPath $Destination
+    }
 }
+
 
 function Get-FirstExeInFolder {
     param(
@@ -580,11 +822,13 @@ function Ensure-GitHubZipToolInstalled {
         $exePath = Join-Path $InstallDir $ExeRelativePath
         if (Test-Path $exePath) { return $exePath }
     }
-
-    # Otherwise, if anything is already installed, use it
-    $existingExe = Get-FirstExeInFolder -Folder $InstallDir
-    if ($existingExe) { return $existingExe }
-
+    # If caller did NOT provide an exact EXE path, we can try to reuse an existing install.
+    # IMPORTANT: If ExeRelativePath is provided and InstallDir contains multiple tools, auto-picking "first exe"
+    # can launch the wrong application.
+    if (-not $ExeRelativePath) {
+        $existingExe = Get-FirstExeInFolder -Folder $InstallDir
+        if ($existingExe) { return $existingExe }
+    }
     # Pull latest release + matching zip asset
     $info = Get-LatestReleaseAssetInfo -Owner $Owner -Repo $Repo -AssetNameRegex $AssetNameRegex
 
@@ -622,6 +866,444 @@ function Ensure-GitHubZipToolInstalled {
     $exeFound
 }
 
+function Set-UpdateFlowUi {
+    param(
+        [string]$Text,
+        [int]$Percent = -1,          # -1 keeps current
+        [bool]$Show = $true,
+        [bool]$Indeterminate = $false
+    )
+
+    if (-not $Window) { return }
+
+    $Window.Dispatcher.Invoke([action]{
+        if ($TxtUpdateFlowStatus) {
+            $TxtUpdateFlowStatus.Text = $Text
+            $TxtUpdateFlowStatus.Visibility = if ($Show) { "Visible" } else { "Collapsed" }
+        }
+        if ($PbUpdateFlow) {
+            $PbUpdateFlow.Visibility = if ($Show) { "Visible" } else { "Collapsed" }
+            $PbUpdateFlow.IsIndeterminate = $Indeterminate
+            if (-not $Indeterminate -and $Percent -ge 0) {
+                if ($Percent -lt 0) { $Percent = 0 }
+                if ($Percent -gt 100) { $Percent = 100 }
+                $PbUpdateFlow.Value = $Percent
+            }
+        }
+    })
+}
+
+function Set-UpdateButtonsEnabled {
+    param([bool]$Enabled)
+
+    $Window.Dispatcher.Invoke([action]{
+        if ($BtnCheckUpdates) { $BtnCheckUpdates.IsEnabled = $Enabled }
+        if ($BtnUpdateNow)    { $BtnUpdateNow.IsEnabled    = $Enabled }
+    })
+}
+
+function Request-GracefulWatchdogStop {
+    # Writes stop signal for your service loop to gracefully stop roles
+    try {
+        New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null
+        Add-GuiLog "Stop signal written: $StopSignalFile"
+    } catch {
+        Add-GuiLog "WARNING: Failed writing stop signal: $_"
+    }
+}
+
+function Stop-ServiceAndWait {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$TimeoutSeconds = 45
+    )
+
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return $true } # Treat as already stopped/not installed
+
+    if ($svc.Status -eq "Stopped") { return $true }
+
+    Request-GracefulWatchdogStop
+
+    Stop-Service -Name $Name -ErrorAction Stop
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        Start-Sleep -Milliseconds 500
+        $svc.Refresh()
+        if ($svc.Status -eq "Stopped") { return $true }
+    }
+
+    throw "Service '$Name' did not stop within ${TimeoutSeconds}s."
+}
+
+function Start-ServiceAndWait {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { throw "Service '$Name' is not installed." }
+
+    if ($svc.Status -ne "Running") {
+        Start-Service -Name $Name -ErrorAction Stop
+    }
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        Start-Sleep -Milliseconds 500
+        $svc.Refresh()
+        if ($svc.Status -eq "Running") { return $true }
+    }
+
+    throw "Service '$Name' did not reach Running state within ${TimeoutSeconds}s."
+}
+
+function Download-FileWithProgress {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+
+    # Ensure TLS 1.2 for GitHub
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent", "WoWWatchdog")
+
+    $script:dlCompleted = $false
+    $script:dlError     = $null
+
+    $wc.add_DownloadProgressChanged({
+        param($s, $e)
+        Set-UpdateFlowUi -Text ("Downloading update. {0}%" -f $e.ProgressPercentage) -Percent $e.ProgressPercentage -Show $true -Indeterminate $false
+    })
+
+    $wc.add_DownloadFileCompleted({
+        param($s, $e)
+        if ($e.Error) { $script:dlError = $e.Error }
+        $script:dlCompleted = $true
+    })
+
+    Set-UpdateFlowUi -Text "Starting download." -Percent 0 -Show $true -Indeterminate $true
+    $wc.DownloadFileAsync([Uri]$Url, $OutFile)
+
+    while (-not $script:dlCompleted) { Start-Sleep -Milliseconds 120 }
+
+    if ($script:dlError) { throw "Download failed: $($script:dlError.Message)" }
+    if (-not (Test-Path $OutFile)) { throw "Download did not create file: $OutFile" }
+
+    return $true
+}
+
+function Run-InstallerAndWait {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath
+    )
+
+    if (-not (Test-Path $InstallerPath)) {
+        throw "Installer not found: $InstallerPath"
+    }
+
+    $installerArgs = @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-"
+    )
+
+    Set-UpdateFlowUi -Text "Running installer." -Percent 100 -Show $true -Indeterminate $true
+
+    $p = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -PassThru -Wait -ErrorAction Stop
+    if ($p.ExitCode -ne 0) {
+        throw "Installer failed with exit code $($p.ExitCode)."
+    }
+
+    return $true
+}
+
+function Backup-Database {
+    param(
+        [Parameter(Mandatory)][string]$MySqlDumpPath,
+        [Parameter(Mandatory)][string]$DbHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$User,
+
+        # Prefer PSCredential; if omitted, backup runs with no password.
+        [Parameter()][pscredential]$Credential,
+
+        [Parameter(Mandatory)][string[]]$Databases,
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [string]$FilePrefix = "Backup",
+        [switch]$Compress,
+        [int]$RetentionDays = 0,
+        [string]$ExtraArgs = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $MySqlDumpPath)) { throw "mysqldump.exe not found: $MySqlDumpPath" }
+    if ([string]::IsNullOrWhiteSpace($DbHost)) { throw "DbHost cannot be empty." }
+    if (-not (Test-Path -LiteralPath $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+    if (-not $Databases -or $Databases.Count -lt 1) { throw "No databases specified for backup." }
+
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $dbList = ($Databases | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "_"
+    $baseName = "{0}_{1}_{2}" -f $FilePrefix, $dbList, $ts
+    $sqlPath = Join-Path $OutputFolder ($baseName + ".sql")
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $MySqlDumpPath
+
+    # Build args (do NOT include password here)
+    $backupArgs = @(
+        "--host=$DbHost",
+        "--port=$Port",
+        "--user=$User"
+    )
+
+    if ($ExtraArgs) {
+        # keep as raw tokens
+        $backupArgs += ($ExtraArgs -split "\s+" | Where-Object { $_ })
+    }
+
+    # Add databases at end
+    $backupArgs += "--databases"
+    $backupArgs += $Databases
+
+    $psi.Arguments = ($backupArgs -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow = $true
+
+    # Inject MYSQL_PWD only at process boundary, and only if provided
+    $pwdPtr   = [IntPtr]::Zero
+    $plainPwd = $null
+
+    try {
+        if ($Credential -and $Credential.Password) {
+            $pwdPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtr)
+
+            if (-not [string]::IsNullOrWhiteSpace($plainPwd)) {
+                $psi.EnvironmentVariables["MYSQL_PWD"] = $plainPwd
+            }
+        }
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+
+        if (-not $proc.Start()) { throw "Failed to start mysqldump.exe" }
+
+        # Stream stdout (SQL) directly to file (avoid ReadToEnd() memory blow-ups)
+        $fs = [System.IO.File]::Open(
+            $sqlPath,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+
+        try {
+            $proc.StandardOutput.BaseStream.CopyTo($fs)
+            $fs.Flush()
+        }
+        finally {
+            $fs.Dispose()
+        }
+
+        # Read stderr after stdout has been fully drained
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+
+        if ($proc.ExitCode -ne 0) {
+            throw ("mysqldump failed (exit {0}): {1}" -f $proc.ExitCode, ($stderr.Trim()))
+        }
+    }
+    finally {
+        if ($pwdPtr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtr)
+        }
+        # best-effort cleanup (cannot guarantee removal from managed memory, but avoids lingering references)
+        $plainPwd = $null
+    }
+
+    # Optional zip
+    $finalPath = $sqlPath
+    if ($Compress) {
+        $zipPath = Join-Path $OutputFolder ($baseName + ".zip")
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+        Compress-Archive -Path $sqlPath -DestinationPath $zipPath -Force
+        Remove-Item $sqlPath -Force -ErrorAction SilentlyContinue
+        $finalPath = $zipPath
+    }
+
+    # Retention
+    if ($RetentionDays -gt 0) {
+        $cutoff = (Get-Date).AddDays(-$RetentionDays)
+        Get-ChildItem -Path $OutputFolder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff -and ($_.Extension -in ".sql", ".zip") } |
+            ForEach-Object {
+                try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch { }
+            }
+    }
+
+    return $finalPath
+}
+
+function Restore-Database {
+    param(
+        [Parameter(Mandatory)][string]$MySqlPath,
+        [Parameter(Mandatory)][string]$DbHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$User,
+
+        [Parameter()][pscredential]$Credential,
+
+        [Parameter(Mandatory)][string]$SqlFile,
+        [Parameter(Mandatory)][string]$TargetDatabase,
+        [switch]$CreateIfMissing,
+        [switch]$Force,
+        [string]$ExtraArgs = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $MySqlPath)) { throw "mysql.exe not found: $MySqlPath" }
+    if (-not (Test-Path -LiteralPath $SqlFile)) { throw "SQL file not found: $SqlFile" }
+
+    $allowed = @("legion_auth","legion_characters","legion_hotfixes","legion_world")
+    if ($allowed -notcontains $TargetDatabase) {
+        throw "Target database '$TargetDatabase' is not in the allowed list: $($allowed -join ', ')"
+    }
+
+    try {
+        $leaf = ([IO.Path]::GetFileName($SqlFile)).ToLowerInvariant()
+        if ($leaf -notmatch [regex]::Escape($TargetDatabase.ToLowerInvariant())) {
+            Add-GuiLog "WARNING: SQL filename does not contain target DB name '$TargetDatabase'. Proceeding anyway."
+        }
+    } catch { }
+
+    # Helper: start mysql.exe with MYSQL_PWD if available
+    function Start-MySqlProcess([string]$arguments) {
+        $psiX = New-Object System.Diagnostics.ProcessStartInfo
+        $psiX.FileName = $MySqlPath
+        $psiX.Arguments = $arguments
+        $psiX.UseShellExecute = $false
+        $psiX.RedirectStandardOutput = $true
+        $psiX.RedirectStandardError  = $true
+        $psiX.CreateNoWindow = $true
+        $bt = [char]96 # `
+        function Quote-MySqlIdent([string]$name) { return ($bt + $name + $bt) }
+
+        $pwdPtrLocal = [IntPtr]::Zero
+        try {
+            if ($Credential -and $Credential.Password) {
+                $pwdPtrLocal = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+                $plainPwdLocal = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtrLocal)
+                if (-not [string]::IsNullOrWhiteSpace($plainPwdLocal)) {
+                    $psiX.EnvironmentVariables["MYSQL_PWD"] = $plainPwdLocal
+                }
+            }
+
+            $p = [Diagnostics.Process]::Start($psiX)
+            return @{ Proc = $p; Ptr = $pwdPtrLocal }
+        }
+        catch {
+            if ($pwdPtrLocal -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtrLocal) }
+            throw
+        }
+    }
+
+    # Create DB if missing
+    if ($CreateIfMissing) {
+        $q = Quote-MySqlIdent $d
+        $createQuery = "CREATE DATABASE IF NOT EXISTS $q CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        $cmdArgs = "--host=$DbHost --port=$Port --user=$User --batch --skip-column-names -e `"$createQuery`""
+
+        $r = Start-MySqlProcess $cmdArgs
+        try {
+            $errC = $r.Proc.StandardError.ReadToEnd()
+            $r.Proc.WaitForExit()
+            if ($r.Proc.ExitCode -ne 0) { throw "Failed to ensure DB exists: $errC" }
+        } finally {
+            if ($r.Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($r.Ptr) }
+        }
+    }
+
+    # Drop/recreate if Force
+    if ($Force) {
+        $q = Quote-MySqlIdent $d
+        $dropQuery = "DROP DATABASE IF EXISTS $q; CREATE DATABASE $q CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+        $cmdArgs = "--host=$DbHost --port=$Port --user=$User --batch --skip-column-names -e `"$dropQuery`""
+
+        $r = Start-MySqlProcess $cmdArgs
+        try {
+            $errD = $r.Proc.StandardError.ReadToEnd()
+            $r.Proc.WaitForExit()
+            if ($r.Proc.ExitCode -ne 0) { throw "Failed to drop/recreate DB: $errD" }
+        } finally {
+            if ($r.Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($r.Ptr) }
+        }
+    }
+
+    # Import SQL via stdin
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $MySqlPath
+
+    $restoreArgs = @(
+        "--host=$DbHost",
+        "--port=$Port",
+        "--user=$User",
+        "--database=$TargetDatabase"
+    )
+    if ($ExtraArgs) { $restoreArgs += ($ExtraArgs -split "\s+" | Where-Object { $_ }) }
+
+    $psi.Arguments = ($restoreArgs -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow = $true
+
+    $pwdPtr = [IntPtr]::Zero
+    try {
+        if ($Credential -and $Credential.Password) {
+            $pwdPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtr)
+            if (-not [string]::IsNullOrWhiteSpace($plainPwd)) {
+                $psi.EnvironmentVariables["MYSQL_PWD"] = $plainPwd
+            }
+        }
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        if (-not $proc.Start()) { throw "Failed to start mysql.exe for restore." }
+
+        $in = $proc.StandardInput
+        try {
+            Get-Content -LiteralPath $SqlFile -Raw | ForEach-Object { $in.Write($_) }
+        } finally {
+            $in.Close()
+        }
+
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+
+        if ($proc.ExitCode -ne 0) {
+            throw ("mysql restore failed (exit {0}): {1}" -f $proc.ExitCode, ($stderr.Trim()))
+        }
+
+        return $true
+    }
+    finally {
+        if ($pwdPtr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtr)
+        }
+        Remove-Variable plainPwd -ErrorAction SilentlyContinue
+    }
+}
+
 # -------------------------------------------------
 # XAML – Dark/Blue Theme
 # -------------------------------------------------
@@ -629,7 +1311,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WoW Watchdog"
-        Width="920" Height="1000"
+        Width="1920" Height="1080"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResizeWithGrip"
         Background="Transparent"
@@ -1479,75 +2161,243 @@ $xaml = @"
     </ScrollViewer>
   </TabItem>
 
-  <!-- ================================================= -->
-  <!-- TAB 3: Tools                                      -->
-  <!-- ================================================= -->
-  <TabItem Header="Tools">
+<!-- ================================================= -->
+<!-- TAB 3: Tools                                      -->
+<!-- ================================================= -->
+<TabItem Header="Tools">
   <Grid Margin="12">
     <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>  <!-- Header -->
-      <RowDefinition Height="Auto"/>  <!-- Buttons / tools -->
-      <RowDefinition Height="*"/>     <!-- Future content -->
+      <RowDefinition Height="Auto"/>  <!-- Launchers -->
+      <RowDefinition Height="Auto"/>  <!-- DB Backup/Restore -->
+      <RowDefinition Height="*"/>     <!-- Status / future -->
     </Grid.RowDefinitions>
 
-        <!-- Tools tab content -->
-        <Grid Margin="12">
+    <!-- Launchers -->
+    <GroupBox Grid.Row="0" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+      <GroupBox.Header>
+        <TextBlock Text="Launchers" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+      </GroupBox.Header>
+      <GroupBox.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#FF151B28" Offset="0.0"/>
+          <GradientStop Color="#FF111623" Offset="1.0"/>
+        </LinearGradientBrush>
+      </GroupBox.Background>
+
+      <Grid Margin="10">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <GroupBox Grid.Row="1" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
-            <GroupBox.Header>
-            <TextBlock Text="Launchers"
-                        Foreground="#FFBDDCFF"
-                        FontWeight="SemiBold"/>
-            </GroupBox.Header>
-            <GroupBox.Background>
-            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-                <GradientStop Color="#FF151B28" Offset="0.0"/>
-                <GradientStop Color="#FF111623" Offset="1.0"/>
-            </LinearGradientBrush>
-            </GroupBox.Background>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
 
-            <Grid Margin="10">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
+        <!-- Row 0: SPP Legion V2 Manager -->
+        <Button x:Name="BtnLaunchSppManager"
+                Grid.Row="0"
+                Grid.Column="0"
+                Content="SPP Legion V2 Manager"
+                MinWidth="220"
+                Height="40"
+                Margin="0,0,12,0"
+                Style="{StaticResource BtnPrimary}"/>
 
-            <Button x:Name="BtnLaunchSppManager"
-                    Grid.Column="0"
-                    Content="SPP Legion V2 Manager"
-                    MinWidth="220"
-                    Height="40"
-                    Background="#FF3478BF"
-                    Foreground="White"
-                    BorderBrush="#FF2B5E9A"
-                    BorderThickness="1"
-                    Margin="0,0,12,0"/>
-
-        <TextBlock Grid.Column="1"
-           TextWrapping="Wrap"
-           Foreground="#FF86B5E5"
-           VerticalAlignment="Center">
-            <Hyperlink NavigateUri="https://github.com/skeezerbean">
-            The latest release will be downloaded and launched. Credit to Skeezerbean.
-            </Hyperlink>
+        <TextBlock Grid.Row="0"
+                   Grid.Column="1"
+                   TextWrapping="Wrap"
+                   Foreground="#FF86B5E5"
+                   VerticalAlignment="Center">
+          <Hyperlink NavigateUri="https://github.com/skeezerbean">
+            If not already installed by the launcher, the latest release will be downloaded. Credit to Skeezerbean.
+          </Hyperlink>
         </TextBlock>
 
-            </Grid>
-        </GroupBox>
+        <!-- Row 1: BattleShopEditor -->
+        <Button x:Name="BtnBattleShopEditor"
+                Grid.Row="1"
+                Grid.Column="0"
+                Content="BattleShopEditor"
+                MinWidth="220"
+                Height="40"
+                Margin="0,8,12,0"
+                Style="{StaticResource BtnPrimary}"/>
 
-        <!-- Optional: status text -->
-        <TextBlock Grid.Row="2"
-                    x:Name="TxtToolsStatus"
-                    Foreground="#FF86B5E5"
-                    TextWrapping="Wrap"/>
-        </Grid>
-    </Grid>
-  </TabItem>
+        <TextBlock Grid.Row="1"
+                   Grid.Column="1"
+                   Margin="0,8,0,0"
+                   TextWrapping="Wrap"
+                   Foreground="#FF86B5E5"
+                   VerticalAlignment="Center">
+          Downloads and extracts BattleShopEditor if missing, then launches it.
+        </TextBlock>
+      </Grid>
+    </GroupBox>
+
+    <!-- Database Backup / Restore -->
+    <GroupBox Grid.Row="1" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+      <GroupBox.Header>
+        <TextBlock Text="Database Backup / Restore" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+      </GroupBox.Header>
+      <GroupBox.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#FF151B28" Offset="0.0"/>
+          <GradientStop Color="#FF111623" Offset="1.0"/>
+        </LinearGradientBrush>
+      </GroupBox.Background>
+
+      <Grid Margin="10">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/> <!-- Backup folder -->
+          <RowDefinition Height="Auto"/> <!-- Backup options -->
+          <RowDefinition Height="Auto"/> <!-- Backup button -->
+          <RowDefinition Height="Auto"/> <!-- Divider -->
+          <RowDefinition Height="Auto"/> <!-- Restore file -->
+          <RowDefinition Height="Auto"/> <!-- Detected DBs -->
+          <RowDefinition Height="Auto"/> <!-- Confirmation -->
+          <RowDefinition Height="Auto"/> <!-- Restore button -->
+        </Grid.RowDefinitions>
+
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="180"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="110"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- BACKUP -->
+        <TextBlock Grid.Row="0" Grid.Column="0"
+                   VerticalAlignment="Center"
+                   Foreground="#FF86B5E5"
+                   Text="Backup folder:"/>
+
+        <TextBox x:Name="TxtDbBackupFolder"
+                 Grid.Row="0" Grid.Column="1"
+                 Margin="8,2,8,6"
+                 MinWidth="320"/>
+
+        <Button x:Name="BtnBrowseDbBackupFolder"
+                Grid.Row="0" Grid.Column="2"
+                Margin="0,2,0,6"
+                Content="Browse"
+                MinHeight="28"
+                Style="{StaticResource BtnSecondary}"/>
+
+        <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                    Orientation="Horizontal"
+                    Margin="0,0,0,6">
+          <CheckBox x:Name="ChkDbBackupCompress"
+                    Content="Compress (.zip)"
+                    Foreground="White"
+                    VerticalAlignment="Center"
+                    Margin="0,0,18,0"/>
+
+          <TextBlock Text="Retention (days):"
+                     Foreground="#FF86B5E5"
+                     VerticalAlignment="Center"
+                     Margin="0,0,8,0"/>
+
+          <TextBox x:Name="TxtDbBackupRetentionDays"
+                   Width="60"
+                   Text="14"/>
+        </StackPanel>
+
+        <Button x:Name="BtnRunDbBackup"
+                Grid.Row="2" Grid.Column="2"
+                Content="Run Backup"
+                MinHeight="30"
+                Style="{StaticResource BtnPrimary}"/>
+
+        <!-- Status / progress (initially hidden) -->
+        <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,2,10,0">
+          <TextBlock x:Name="TxtDbBackupStatus"
+                     Foreground="#FF86B5E5"
+                     Text=" "
+                     Visibility="Collapsed"/>
+          <ProgressBar x:Name="PbDbBackup"
+                       Height="12"
+                       IsIndeterminate="True"
+                       Visibility="Collapsed"/>
+        </StackPanel>
+
+        <Separator Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3"
+                   Margin="0,10,0,10"
+                   Background="#FF2B3E5E"/>
+
+        <!-- RESTORE -->
+        <TextBlock Grid.Row="4" Grid.Column="0"
+                   VerticalAlignment="Center"
+                   Foreground="#FF86B5E5"
+                   Text="Restore .sql/.zip file:"/>
+
+        <TextBox x:Name="TxtDbRestoreFile"
+                 Grid.Row="4" Grid.Column="1"
+                 Margin="8,2,8,6"
+                 MinWidth="320"/>
+
+        <Button x:Name="BtnBrowseDbRestoreFile"
+                Grid.Row="4" Grid.Column="2"
+                Margin="0,2,0,6"
+                Content="Browse"
+                MinHeight="28"
+                Style="{StaticResource BtnSecondary}"/>
+
+        <TextBlock Grid.Row="5" Grid.Column="0"
+                   VerticalAlignment="Center"
+                   Foreground="#FF86B5E5"
+                   Text="Databases in file:"/>
+
+        <TextBox x:Name="TxtDbRestoreDatabases"
+                 Grid.Row="5" Grid.Column="1"
+                 Margin="8,2,8,6"
+                 MinWidth="320"
+                 IsReadOnly="True"
+                 Text="(Detected at restore time)"
+                 TextWrapping="Wrap"
+                 AcceptsReturn="True"
+                 VerticalScrollBarVisibility="Auto"/>
+
+        <TextBlock Grid.Row="5" Grid.Column="2"
+                   VerticalAlignment="Center"
+                   Foreground="#FF86B5E5"
+                   Text="(Multi-DB restore)"/>
+
+        <CheckBox x:Name="ChkDbRestoreConfirm"
+                  Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="3"
+                  Margin="0,6,0,8"
+                  Foreground="#FFFFB347"
+                  Content="I understand this will overwrite data in the databases contained in the file."/>
+
+        <!-- Status / progress (initially hidden) -->
+        <StackPanel Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2"
+                    Margin="0,2,10,0">
+          <TextBlock x:Name="TxtDbRestoreStatus"
+                     Foreground="#FF86B5E5"
+                     Text=" "
+                     Visibility="Collapsed"/>
+          <ProgressBar x:Name="PbDbRestore"
+                       Height="12"
+                       IsIndeterminate="True"
+                       Visibility="Collapsed"/>
+        </StackPanel>
+
+        <Button x:Name="BtnRunDbRestore"
+                Grid.Row="7" Grid.Column="2"
+                Content="Run Restore"
+                MinHeight="30"
+                Style="{StaticResource BtnStop}"/>
+
+      </Grid>
+    </GroupBox>
+
+    <!-- Optional: status text -->
+    <TextBlock Grid.Row="2"
+               x:Name="TxtToolsStatus"
+               Foreground="#FF86B5E5"
+               TextWrapping="Wrap"/>
+  </Grid>
+</TabItem>
 
   <!-- ================================================= -->
   <!-- TAB 4: Updates                                   -->
@@ -1636,6 +2486,24 @@ $xaml = @"
                       Foreground="White"
                       Visibility="Collapsed"/>
             </StackPanel>
+
+        <!-- Progress / status (initially hidden) -->
+        <StackPanel Grid.Row="1" Margin="0,12,0,0">
+
+        <TextBlock x:Name="TxtUpdateFlowStatus"
+                    Text=""
+                    Foreground="#FF86B5E5"
+                    TextWrapping="Wrap"
+                    Visibility="Collapsed"
+                    Margin="0,0,0,6"/>
+
+        <ProgressBar x:Name="PbUpdateFlow"
+                    Height="16"
+                    Minimum="0"
+                    Maximum="100"
+                    Value="0"
+                    Visibility="Collapsed"/>
+        </StackPanel>
 
           </Grid>
         </GroupBox>
@@ -1740,11 +2608,12 @@ try {
 $Window.AddHandler(
     [System.Windows.Documents.Hyperlink]::RequestNavigateEvent,
     [System.Windows.Navigation.RequestNavigateEventHandler]{
-        param($sender, $e)
+        param($uiSender, $uiEventArgs)
 
         try {
-            Start-Process $e.Uri.AbsoluteUri
-            $e.Handled = $true
+        Start-Process $uiEventArgs.Uri.AbsoluteUri
+        $uiEventArgs.Handled = $true
+
         } catch {
             [System.Windows.MessageBox]::Show(
                 "Failed to open link: $($e.Uri.AbsoluteUri)`n$($_.Exception.Message)",
@@ -1817,6 +2686,8 @@ $EllipseWorld       = $Window.FindName("EllipseWorld")
 $TxtWatchdogStatus  = $Window.FindName("TxtWatchdogStatus")
 $TxtLiveLog         = $Window.FindName("TxtLiveLog")
 
+$BtnBattleShopEditor = Assert-Control $Window "BtnBattleShopEditor"
+
 # NTFY controls
 $CmbExpansion          = $Window.FindName("CmbExpansion")
 $TxtExpansionCustom    = $Window.FindName("TxtExpansionCustom")
@@ -1865,6 +2736,23 @@ $TxtDbPassword    = $Window.FindName("TxtDbPassword")
 $BtnSaveDbPassword= $Window.FindName("BtnSaveDbPassword")
 $BtnTestDb        = $Window.FindName("BtnTestDb")
 
+# Tools tab - DB Backup/Restore controls (MATCH XAML)
+$TxtDbBackupFolder       = Assert-Control $Window "TxtDbBackupFolder"
+$BtnBrowseDbBackupFolder = Assert-Control $Window "BtnBrowseDbBackupFolder"
+$ChkDbBackupCompress     = Assert-Control $Window "ChkDbBackupCompress"
+$TxtDbBackupRetentionDays= Assert-Control $Window "TxtDbBackupRetentionDays"
+$BtnRunDbBackup          = Assert-Control $Window "BtnRunDbBackup"
+$TxtDbBackupStatus       = $Window.FindName("TxtDbBackupStatus")
+$PbDbBackup              = $Window.FindName("PbDbBackup")
+$PbDbRestore             = Assert-Control $Window "PbDbRestore"
+$TxtDbRestoreDatabases   = Assert-Control $Window "TxtDbRestoreDatabases"
+
+$TxtDbRestoreFile        = Assert-Control $Window "TxtDbRestoreFile"
+$BtnBrowseDbRestoreFile  = Assert-Control $Window "BtnBrowseDbRestoreFile"
+$ChkDbRestoreConfirm     = Assert-Control $Window "ChkDbRestoreConfirm"
+$BtnRunDbRestore         = Assert-Control $Window "BtnRunDbRestore"
+$TxtDbRestoreStatus      = Assert-Control $Window "TxtDbRestoreStatus"
+
 $TxtUtilMySQLCpu  = Assert-Control $Window "TxtUtilMySQLCpu"
 $TxtUtilMySQLMem  = Assert-Control $Window "TxtUtilMySQLMem"
 $TxtUtilAuthCpu   = Assert-Control $Window "TxtUtilAuthCpu"
@@ -1878,10 +2766,1317 @@ $TxtCurrentVersion = $Window.FindName("TxtCurrentVersion")
 $TxtLatestVersion  = $Window.FindName("TxtLatestVersion")
 $BtnCheckUpdates   = $Window.FindName("BtnCheckUpdates")
 $BtnUpdateNow      = $Window.FindName("BtnUpdateNow")
+$TxtUpdateFlowStatus = $Window.FindName("TxtUpdateFlowStatus")
+$PbUpdateFlow        = $Window.FindName("PbUpdateFlow")
 
 $BtnLaunchSppManager = $Window.FindName("BtnLaunchSppManager")
 
+# -------------------------------------------------
+# Global WPF safety net: log unhandled UI exceptions
+# -------------------------------------------------
+try {
+    # Ensure WPF app object exists
+    if (-not [System.Windows.Application]::Current) {
+        $null = New-Object System.Windows.Application
+    }
+
+    # Only attach once (avoid duplicate logs if script re-loads)
+    if (-not $script:DispatcherUnhandledExceptionHooked) {
+        $script:DispatcherUnhandledExceptionHooked = $true
+
+        [System.Windows.Application]::Current.add_DispatcherUnhandledException({
+            param($sender, $e)
+
+            try {
+                $ex = $e.Exception
+                $msg = if ($ex) { $ex.ToString() } else { "Unknown Dispatcher exception (no Exception object)." }
+
+                # Your log function
+                Add-GuiLog "UNHANDLED UI EXCEPTION: $msg"
+
+                # Optional: show a minimal user prompt (comment out if you prefer silent logging)
+                try {
+                    [System.Windows.MessageBox]::Show(
+                        "An unexpected UI error occurred. Details were written to the log.",
+                        "WoW Watchdog",
+                        [System.Windows.MessageBoxButton]::OK,
+                        [System.Windows.MessageBoxImage]::Error
+                    ) | Out-Null
+                } catch { }
+            }
+            catch { }
+
+            # Prevent the app from crashing to desktop
+            $e.Handled = $true
+        })
+    }
+}
+catch {
+    # As a last resort, don't crash if logging setup fails
+}
+
 $TxtCurrentVersion.Text = $AppVersion.ToString()
+
+if ([string]::IsNullOrWhiteSpace($TxtDbBackupFolder.Text)) {
+    $TxtDbBackupFolder.Text = (Join-Path $DataDir "backups")
+}
+if ([string]::IsNullOrWhiteSpace($TxtDbBackupRetentionDays.Text)) {
+    $TxtDbBackupRetentionDays.Text = "14"
+}
+if ($ChkDbBackupCompress) { $ChkDbBackupCompress.IsChecked = $true }
+if ($ChkDbRestoreConfirm) { $ChkDbRestoreConfirm.IsChecked = $false }
+
+# ---- Hard defaults based on repack bundle ----
+$DefaultMySqlDump = 'C:\wowsrv\database\bin\mysqldump.exe'
+$DefaultMySqlExe  = 'C:\wowsrv\database\bin\mysql.exe'
+$DefaultSchemas   = @('legion_auth','legion_characters','legion_hotfixes','legion_world')
+
+function Get-SelectedComboText($ComboBox) {
+    if ($ComboBox.SelectedItem -is [System.Windows.Controls.ComboBoxItem]) {
+        return $ComboBox.SelectedItem.Content.ToString()
+    }
+    return [string]$ComboBox.SelectedItem
+}
+
+function script:Set-DbBackupUiState {
+    param(
+        [bool]$IsBusy,
+        [string]$StatusText = $null
+    )
+
+    if ($null -ne $StatusText) {
+        $TxtDbBackupStatus.Text = $StatusText
+        $TxtDbBackupStatus.Visibility = "Visible"
+    }
+
+    $PbDbBackup.Visibility = if ($IsBusy) { "Visible" } else { "Collapsed" }
+
+    if (-not $IsBusy -and [string]::IsNullOrWhiteSpace(($TxtDbBackupStatus.Text + "").Trim())) {
+        $TxtDbBackupStatus.Visibility = "Collapsed"
+    }
+
+    $BtnRunDbBackup.IsEnabled = -not $IsBusy
+    $BtnRunDbRestore.IsEnabled = -not $IsBusy
+    $BtnBrowseDbBackupFolder.IsEnabled = -not $IsBusy
+    $BtnBrowseDbRestoreFile.IsEnabled = -not $IsBusy
+    $ChkDbBackupCompress.IsEnabled = -not $IsBusy
+    $TxtDbBackupRetentionDays.IsEnabled = -not $IsBusy
+    $TxtDbBackupFolder.IsEnabled = -not $IsBusy
+    $TxtDbRestoreFile.IsEnabled = -not $IsBusy
+    $ChkDbRestoreConfirm.IsEnabled = -not $IsBusy
+}
+
+$script:UiRunspace = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace
+
+function Invoke-UiSafe {
+    param([Parameter(Mandatory)][scriptblock]$Action)
+
+    try {
+        if ($null -ne $Window -and $null -ne $Window.Dispatcher `
+            -and -not $Window.Dispatcher.HasShutdownStarted `
+            -and -not $Window.Dispatcher.HasShutdownFinished) {
+
+            $null = $Window.Dispatcher.BeginInvoke([System.Action]{
+                try { & $Action } catch { }
+            })
+        } else {
+            try { & $Action } catch { }
+        }
+    } catch { }
+}
+
+function Set-ControlTextSafe {
+    param($Control, [string]$Value)
+
+    Invoke-UiSafe {
+        try {
+            if ($null -ne $Control -and $Control.PSObject.Properties.Match("Text").Count -gt 0) {
+                $Control.Text = $Value
+            }
+        } catch { }
+    }
+}
+
+function Set-ControlVisibilitySafe {
+    param($Control, [string]$Visibility) # "Visible" / "Collapsed"
+
+    Invoke-UiSafe {
+        try {
+            if ($null -ne $Control -and $Control.PSObject.Properties.Match("Visibility").Count -gt 0) {
+                $Control.Visibility = $Visibility
+            }
+        } catch { }
+    }
+}
+
+function Set-ControlEnabledSafe {
+    param($Control, [bool]$IsEnabled)
+
+    Invoke-UiSafe {
+        try {
+            if ($null -ne $Control -and $Control.PSObject.Properties.Match("IsEnabled").Count -gt 0) {
+                $Control.IsEnabled = $IsEnabled
+            }
+        } catch { }
+    }
+}
+
+function Get-DbConfig {
+    # Host/port/user come from config schema used elsewhere
+    $dbHost = [string]$Config.DbHost
+    if ([string]::IsNullOrWhiteSpace($dbHost)) { $dbHost = "127.0.0.1" }
+
+    $port = 3306
+    try { $port = [int]$Config.DbPort } catch { $port = 3306 }
+    if ($port -lt 1 -or $port -gt 65535) { $port = 3306 }
+
+    $user = [string]$Config.DbUser
+    if ([string]::IsNullOrWhiteSpace($user)) { $user = "root" }
+
+    # mysql.exe comes from Config.MySQLExe (already used by player count)
+    $mysqlExe = [string]$Config.MySQLExe
+    if ([string]::IsNullOrWhiteSpace($mysqlExe)) { $mysqlExe = $DefaultMySqlExe }
+
+    # Derive mysqldump.exe from mysql.exe folder if possible
+    $mysqldumpExe = $DefaultMySqlDump
+    try {
+        if ($mysqlExe -and (Test-Path -LiteralPath $mysqlExe)) {
+            $candidate = Join-Path (Split-Path -Parent $mysqlExe) "mysqldump.exe"
+            if (Test-Path -LiteralPath $candidate) { $mysqldumpExe = $candidate }
+        }
+    } catch { }
+
+    # Password from DPAPI secrets store (key is derived from Host/Port/User via Get-DbSecretKey)
+    $pwdPlain  = Get-DbSecretPassword
+
+    $pwdSecure = $null
+    if (-not [string]::IsNullOrWhiteSpace($pwdPlain)) {
+        $pwdSecure = ConvertTo-SecureString -String $pwdPlain -AsPlainText -Force
+    }
+
+    return [pscustomobject]@{
+        DbHost         = $dbHost
+        Port           = $port
+        User           = $user
+        PasswordSecure = $pwdSecure
+        MySqlExe       = $mysqlExe
+        MySqlDump      = $mysqldumpExe
+    }
+}
+
+$BtnBattleShopEditor.Add_Click({
+    try {
+        # Match your existing "tools install base" approach
+        # Example only; replace with your current base tools path variable/pattern:
+        $toolRoot = $script:ToolsDir
+
+        $exe = Ensure-UrlZipToolInstalled `
+            -ZipUrl "https://cdn.discordapp.com/attachments/576868080165322752/1399580989738586263/BattleShopEditor-v1008.zip?ex=695e6f1e&is=695d1d9e&hm=1830278fb73b2f96e372f8ef22814e275b11e0580cb288e4c3c7a370a3661e1a&" `
+            -InstallDir $toolRoot `
+            -ExeRelativePath "BattleShopEditor\BattleShopEditor.exe" `
+            -ToolName "BattleShopEditor" `
+            -TempZipFileName "BattleShopEditor-v1008.zip"
+
+        Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) | Out-Null
+    } catch {
+        if (Get-Command -Name Add-GuiLog -ErrorAction SilentlyContinue) {
+            Add-GuiLog "BattleShopEditor: $($_.Exception.Message)"
+        } else {
+            Write-Host "BattleShopEditor: $($_.Exception.Message)"
+        }
+
+        try {
+            [System.Windows.MessageBox]::Show($_.Exception.Message, "BattleShopEditor", "OK", "Error") | Out-Null
+        } catch {}
+    }
+})
+
+# -------- Browse: Backup folder --------
+$BtnBrowseDbBackupFolder.Add_Click({
+    try {
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select a folder for DB backups"
+        if (Test-Path $TxtDbBackupFolder.Text) { $dlg.SelectedPath = $TxtDbBackupFolder.Text }
+
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $TxtDbBackupFolder.Text = $dlg.SelectedPath
+        }
+    } catch {
+        Add-GuiLog "Backup folder browse failed: $($_.Exception.Message)"
+    }
+})
+
+# -------- Browse: Restore file --------
+$BtnBrowseDbRestoreFile.Add_Click({
+    try {
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = "SQL or ZIP (*.sql;*.zip)|*.sql;*.zip|SQL files (*.sql)|*.sql|ZIP files (*.zip)|*.zip|All files (*.*)|*.*"
+        $dlg.Title  = "Select a .sql file to restore"
+        if ($dlg.ShowDialog() -eq $true) {
+            $TxtDbRestoreFile.Text = $dlg.FileName
+        }
+    } catch {
+        Add-GuiLog "Restore file browse failed: $($_.Exception.Message)"
+    }
+})
+
+# -------------------------------------------------
+# DB Backup UI state helper (must be in global scope)
+# -------------------------------------------------
+function Set-DbBackupUiState {
+    param(
+        [Parameter(Mandatory)][bool]$IsBusy,
+        [string]$StatusText = $null
+    )
+
+    try {
+        if ($null -ne $StatusText) {
+            $TxtDbBackupStatus.Text = $StatusText
+            $TxtDbBackupStatus.Visibility = "Visible"
+        }
+
+        $PbDbBackup.Visibility = if ($IsBusy) { "Visible" } else { "Collapsed" }
+
+        if (-not $IsBusy -and [string]::IsNullOrWhiteSpace(($TxtDbBackupStatus.Text + "").Trim())) {
+            $TxtDbBackupStatus.Visibility = "Collapsed"
+        }
+
+        # Disable controls that could conflict while running
+        $BtnRunDbBackup.IsEnabled           = -not $IsBusy
+        $BtnRunDbRestore.IsEnabled          = -not $IsBusy
+        $BtnBrowseDbBackupFolder.IsEnabled  = -not $IsBusy
+        $BtnBrowseDbRestoreFile.IsEnabled   = -not $IsBusy
+        $ChkDbBackupCompress.IsEnabled      = -not $IsBusy
+        $TxtDbBackupRetentionDays.IsEnabled = -not $IsBusy
+        $TxtDbBackupFolder.IsEnabled        = -not $IsBusy
+        $TxtDbRestoreFile.IsEnabled         = -not $IsBusy
+        $ChkDbRestoreConfirm.IsEnabled      = -not $IsBusy
+    }
+    catch {
+        # Never let UI toggling kill the app
+        try { Add-GuiLog "Backup UI state update failed: $($_.Exception.Message)" } catch { }
+    }
+}
+
+function Restore-DatabaseMulti {
+    param(
+        [Parameter(Mandatory)][string]$MySqlPath,
+        [Parameter(Mandatory)][string]$DbHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$User,
+
+        [Parameter()][pscredential]$Credential,
+
+        [Parameter(Mandatory)][string]$InputFile,  # .sql OR .zip
+        [switch]$CreateIfMissing,
+        [switch]$Force,
+        [string]$ExtraArgs = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $MySqlPath)) { throw "mysql.exe not found: $MySqlPath" }
+    if (-not (Test-Path -LiteralPath $InputFile)) { throw "Restore file not found: $InputFile" }
+
+    $allowed = @("legion_auth","legion_characters","legion_hotfixes","legion_world")
+
+    # MySQL identifier quoting uses backticks. In PowerShell, build them safely:
+    $bt = [char]96
+    function Quote-MySqlIdent([string]$name) { return ($bt + $name + $bt) }
+
+    # Helper: start mysql.exe with MYSQL_PWD if available
+    function Start-MySqlProcess([string]$arguments) {
+        $psiX = New-Object System.Diagnostics.ProcessStartInfo
+        $psiX.FileName = $MySqlPath
+        $psiX.Arguments = $arguments
+        $psiX.UseShellExecute = $false
+        $psiX.RedirectStandardOutput = $true
+        $psiX.RedirectStandardError  = $true
+        $psiX.CreateNoWindow = $true
+
+        $pwdPtrLocal = [IntPtr]::Zero
+        try {
+            if ($Credential -and $Credential.Password) {
+                $pwdPtrLocal = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+                $plainPwdLocal = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtrLocal)
+                if (-not [string]::IsNullOrWhiteSpace($plainPwdLocal)) {
+                    $psiX.EnvironmentVariables["MYSQL_PWD"] = $plainPwdLocal
+                }
+            }
+
+            $p = [Diagnostics.Process]::Start($psiX)
+            return @{ Proc = $p; Ptr = $pwdPtrLocal }
+        }
+        catch {
+            if ($pwdPtrLocal -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtrLocal) }
+            throw
+        }
+    }
+
+    # ---- Resolve SQL path (supports .zip containing one .sql) ----
+    $sqlPath = $null
+    $tempDir = $null
+
+    try {
+        $ext = ([IO.Path]::GetExtension($InputFile)).ToLowerInvariant()
+        if ($ext -eq ".zip") {
+            $tempDir = Join-Path $env:TEMP ("WoWWatcherRestore_" + ([Guid]::NewGuid().ToString("N")))
+            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+            Expand-Archive -LiteralPath $InputFile -DestinationPath $tempDir -Force
+
+            $sqls = Get-ChildItem -Path $tempDir -Recurse -File -Filter *.sql -ErrorAction SilentlyContinue
+            if (-not $sqls -or $sqls.Count -lt 1) { throw "ZIP does not contain a .sql file." }
+            if ($sqls.Count -gt 1) { throw "ZIP contains multiple .sql files; please use a ZIP with exactly one SQL." }
+
+            $sqlPath = $sqls[0].FullName
+        }
+        else {
+            $sqlPath = $InputFile
+        }
+
+        if (-not (Test-Path -LiteralPath $sqlPath)) { throw "SQL file not found: $sqlPath" }
+
+        # ---- Detect which DBs are in the dump (HEAD ONLY; no 900MB RAM load) ----
+        $headBytes = 8MB
+        $enc = [System.Text.Encoding]::UTF8
+
+        $rawHead = $null
+        $fsHead = [System.IO.File]::Open($sqlPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $buf = New-Object byte[] $headBytes
+            $read = $fsHead.Read($buf, 0, $buf.Length)
+            if ($read -lt 1) { throw "SQL file is empty." }
+            $rawHead = $enc.GetString($buf, 0, $read)
+        }
+        finally {
+            $fsHead.Dispose()
+        }
+
+        $dbsSet = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($m in [regex]::Matches($rawHead, '(?im)^\s*USE\s+`?([a-z0-9_]+)`?\s*;', 'IgnoreCase,Multiline')) {
+            [void]$dbsSet.Add($m.Groups[1].Value)
+        }
+        foreach ($m in [regex]::Matches($rawHead, '(?im)^\s*CREATE\s+DATABASE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([a-z0-9_]+)`?', 'IgnoreCase,Multiline')) {
+            [void]$dbsSet.Add($m.Groups[1].Value)
+        }
+
+        $dbList = @($dbsSet | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        if ($dbList.Count -lt 1) {
+            throw "Could not detect databases in SQL file header (no USE/CREATE DATABASE found early in file)."
+        }
+
+        $disallowed = @($dbList | Where-Object { $allowed -notcontains $_ })
+        if ($disallowed.Count -gt 0) {
+            throw ("Restore file contains unsupported database name(s): {0}. Allowed: {1}" -f ($disallowed -join ", "), ($allowed -join ", "))
+        }
+
+        # ---- Pre-create or force-recreate each DB ----
+        foreach ($d in $dbList) {
+            $q = Quote-MySqlIdent $d
+
+            if ($CreateIfMissing) {
+                $createQuery = "CREATE DATABASE IF NOT EXISTS $q CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+                $cmdArgs = "--host=$DbHost --port=$Port --user=$User --batch --skip-column-names -e `"$createQuery`""
+
+                $r = Start-MySqlProcess $cmdArgs
+                try {
+                    $errC = $r.Proc.StandardError.ReadToEnd()
+                    $r.Proc.WaitForExit()
+                    if ($r.Proc.ExitCode -ne 0) { throw "Failed to ensure DB exists ($d): $errC" }
+                } finally {
+                    if ($r.Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($r.Ptr) }
+                }
+            }
+
+            if ($Force) {
+                $dropQuery = "DROP DATABASE IF EXISTS $q; CREATE DATABASE $q CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+                $cmdArgs = "--host=$DbHost --port=$Port --user=$User --batch --skip-column-names -e `"$dropQuery`""
+
+                $r = Start-MySqlProcess $cmdArgs
+                try {
+                    $errD = $r.Proc.StandardError.ReadToEnd()
+                    $r.Proc.WaitForExit()
+                    if ($r.Proc.ExitCode -ne 0) { throw "Failed to drop/recreate DB ($d): $errD" }
+                } finally {
+                    if ($r.Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($r.Ptr) }
+                }
+            }
+        }
+
+        # ---- Import entire SQL into mysql (NO --database, let USE statements drive) ----
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $MySqlPath
+
+        $restoreArgs = @("--host=$DbHost","--port=$Port","--user=$User")
+        if ($ExtraArgs) { $restoreArgs += ($ExtraArgs -split "\s+" | Where-Object { $_ }) }
+
+        $psi.Arguments = ($restoreArgs -join " ")
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow = $true
+
+        $pwdPtr = [IntPtr]::Zero
+        try {
+            if ($Credential -and $Credential.Password) {
+                $pwdPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+                $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtr)
+                if (-not [string]::IsNullOrWhiteSpace($plainPwd)) {
+                    $psi.EnvironmentVariables["MYSQL_PWD"] = $plainPwd
+                }
+            }
+
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            if (-not $proc.Start()) { throw "Failed to start mysql.exe for restore." }
+
+            # Stream the SQL file to mysql stdin (no giant in-memory string)
+            $src = [System.IO.File]::Open($sqlPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $dst = $proc.StandardInput.BaseStream
+                $buffer = New-Object byte[] (1024 * 1024) # 1MB
+                while (($n = $src.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $dst.Write($buffer, 0, $n)
+                }
+                $dst.Flush()
+            }
+            finally {
+                try { $src.Dispose() } catch { }
+                try { $proc.StandardInput.Close() } catch { }
+            }
+
+            $stderr = $proc.StandardError.ReadToEnd()
+            $proc.WaitForExit()
+
+            if ($proc.ExitCode -ne 0) {
+                throw ("mysql restore failed (exit {0}): {1}" -f $proc.ExitCode, ($stderr.Trim()))
+            }
+
+            return [pscustomobject]@{
+                Ok     = $true
+                DbList = $dbList
+                SqlPath= $sqlPath
+            }
+        }
+        finally {
+            if ($pwdPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtr) }
+            Remove-Variable plainPwd -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
+            try { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+}
+
+# -------------------------------------------------
+# DB Restore UI state helper (global scope)
+# -------------------------------------------------
+
+function Set-DbRestoreUiState {
+    param(
+        [Parameter(Mandatory)][bool]$IsBusy,
+        [string]$StatusText = $null
+    )
+
+    try {
+        if ($null -ne $StatusText) {
+            $TxtDbRestoreStatus.Text = $StatusText
+            $TxtDbRestoreStatus.Visibility = "Visible"
+        }
+
+        # Must be a value, not a scriptblock
+        $PbDbRestore.Visibility = $(if ($IsBusy) { "Visible" } else { "Collapsed" })
+
+        if (-not $IsBusy) {
+            $t = ($TxtDbRestoreStatus.Text + "").Trim()
+            if ([string]::IsNullOrWhiteSpace($t)) {
+                $TxtDbRestoreStatus.Visibility = "Collapsed"
+            }
+        }
+
+        # Restore controls
+        $BtnRunDbRestore.IsEnabled        = -not $IsBusy
+        $BtnBrowseDbRestoreFile.IsEnabled = -not $IsBusy
+        $TxtDbRestoreFile.IsEnabled       = -not $IsBusy
+        $ChkDbRestoreConfirm.IsEnabled    = -not $IsBusy
+
+        # Optional: lock backup during restore
+        $BtnRunDbBackup.IsEnabled           = -not $IsBusy
+        $BtnBrowseDbBackupFolder.IsEnabled  = -not $IsBusy
+        $TxtDbBackupFolder.IsEnabled        = -not $IsBusy
+        $ChkDbBackupCompress.IsEnabled      = -not $IsBusy
+        $TxtDbBackupRetentionDays.IsEnabled = -not $IsBusy
+    }
+    catch {
+        try { Add-GuiLog "Restore UI state update failed: $($_.Exception.Message)" } catch { }
+    }
+}
+
+# -------- Run Backup (PS 5.1 safe async runspace + UI progress; AsyncCallback) --------
+$BtnRunDbBackup.Add_Click({
+    try {
+        Set-DbBackupUiState -IsBusy $true -StatusText "Starting backup… please wait."
+        Add-GuiLog "Backup: Initializing…"
+
+        # Capture inputs on UI thread
+        $db = Get-DbConfig
+
+        $outFolder = ($TxtDbBackupFolder.Text + "").Trim()
+        if ([string]::IsNullOrWhiteSpace($outFolder)) { throw "Backup folder is empty." }
+
+        $retentionDays = 0
+        [void][int]::TryParse(($TxtDbBackupRetentionDays.Text + ""), [ref]$retentionDays)
+
+        $doZip = [bool]$ChkDbBackupCompress.IsChecked
+
+        $candidateSchemas = @(
+            $DefaultSchemas |
+            Where-Object { $_ -and $_.ToString().Trim() } |
+            ForEach-Object { $_.ToString().Trim() }
+        )
+
+        if (-not (Test-Path -LiteralPath $outFolder)) {
+            New-Item -ItemType Directory -Path $outFolder -Force | Out-Null
+        }
+
+        if (-not (Test-Path -LiteralPath $db.MySqlDump)) { throw "mysqldump.exe not found at: $($db.MySqlDump)" }
+        if (-not (Test-Path -LiteralPath $db.MySqlExe))  { throw "mysql.exe not found at: $($db.MySqlExe) (needed for access probing)" }
+
+        # Build PSCredential only if password present
+        $cred = $null
+        if ($db.PasswordSecure -and $db.PasswordSecure.Length -gt 0) {
+            $cred = [pscredential]::new($db.User, $db.PasswordSecure)
+        }
+
+        # UI status immediately
+        $TxtDbBackupStatus.Text = "Backup running…"
+        $TxtDbBackupStatus.Visibility = "Visible"
+
+        $disp = $Window.Dispatcher
+
+        # ---- Dedicated background runspace ----
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.ApartmentState = 'MTA'
+        $rs.ThreadOptions  = 'ReuseThread'
+        $rs.Open()
+
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.Runspace = $rs
+
+        # Script executed in background runspace (NO UI objects referenced here)
+        $script = {
+            param($state)
+
+            function Convert-SecureStringToPlain([Security.SecureString]$sec) {
+                if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+                $bstr = [IntPtr]::Zero
+                try {
+                    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+                    return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+                }
+                finally {
+                    if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+                }
+            }
+
+            function Test-DbAccess {
+                param(
+                    [Parameter(Mandatory)][string]$MySqlExePath,
+                    [Parameter(Mandatory)][string]$DbHost,
+                    [Parameter(Mandatory)][int]$Port,
+                    [Parameter(Mandatory)][string]$User,
+                    [Parameter()][string]$PlainPwd,
+                    [Parameter(Mandatory)][string]$DatabaseName
+                )
+
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = $MySqlExePath
+                $psi.Arguments = "--host=$DbHost --port=$Port --user=$User --database=$DatabaseName --batch --skip-column-names -e `"SELECT 1;`""
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError  = $true
+                $psi.CreateNoWindow = $true
+
+                if (-not [string]::IsNullOrWhiteSpace($PlainPwd)) {
+                    $psi.EnvironmentVariables["MYSQL_PWD"] = $PlainPwd
+                }
+
+                $p = [Diagnostics.Process]::Start($psi)
+                $null = $p.StandardOutput.ReadToEnd()
+                $err  = $p.StandardError.ReadToEnd()
+                $p.WaitForExit()
+
+                if ($p.ExitCode -eq 0) { return @{ Ok = $true; Err = $null } }
+                return @{ Ok = $false; Err = ($err.Trim()) }
+            }
+
+            function Backup-DatabaseInline {
+                param(
+                    [Parameter(Mandatory)][string]$MySqlDumpPath,
+                    [Parameter(Mandatory)][string]$DbHost,
+                    [Parameter(Mandatory)][int]$Port,
+                    [Parameter(Mandatory)][string]$User,
+                    [Parameter()][string]$PlainPwd,
+                    [Parameter(Mandatory)][string[]]$Databases,
+                    [Parameter(Mandatory)][string]$OutputFolder,
+                    [string]$FilePrefix = "Backup",
+                    [switch]$Compress,
+                    [int]$RetentionDays = 0,
+                    [string]$ExtraArgs = ""
+                )
+
+                if (-not (Test-Path -LiteralPath $MySqlDumpPath)) { throw "mysqldump.exe not found: $MySqlDumpPath" }
+                if (-not (Test-Path -LiteralPath $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+                if (-not $Databases -or $Databases.Count -lt 1) { throw "No databases specified for backup." }
+
+                $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+                $dbList = ($Databases | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "_"
+                $baseName = "{0}_{1}_{2}" -f $FilePrefix, $dbList, $ts
+                $sqlPath = Join-Path $OutputFolder ($baseName + ".sql")
+
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = $MySqlDumpPath
+
+                $backupArgs = @("--host=$DbHost","--port=$Port","--user=$User")
+                if ($ExtraArgs) { $backupArgs += ($ExtraArgs -split "\s+" | Where-Object { $_ }) }
+
+                $backupArgs += "--databases"
+                $backupArgs += $Databases
+
+                $psi.Arguments = ($backupArgs -join " ")
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError  = $true
+                $psi.CreateNoWindow = $true
+
+                if (-not [string]::IsNullOrWhiteSpace($PlainPwd)) {
+                    $psi.EnvironmentVariables["MYSQL_PWD"] = $PlainPwd
+                }
+
+                $proc = New-Object System.Diagnostics.Process
+                $proc.StartInfo = $psi
+                if (-not $proc.Start()) { throw "Failed to start mysqldump.exe" }
+
+                $fs = [System.IO.File]::Open($sqlPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+                try {
+                    $sw = New-Object System.IO.StreamWriter($fs, [System.Text.Encoding]::UTF8)
+                    try { $sw.Write($proc.StandardOutput.ReadToEnd()) }
+                    finally { $sw.Flush(); $sw.Dispose() }
+                } finally { $fs.Dispose() }
+
+                $stderr = $proc.StandardError.ReadToEnd()
+                $proc.WaitForExit()
+
+                if ($proc.ExitCode -ne 0) {
+                    throw ("mysqldump failed (exit {0}): {1}" -f $proc.ExitCode, ($stderr.Trim()))
+                }
+
+                $finalPath = $sqlPath
+                if ($Compress) {
+                    $zipPath = Join-Path $OutputFolder ($baseName + ".zip")
+                    if (Test-Path -LiteralPath $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                    Compress-Archive -Path $sqlPath -DestinationPath $zipPath -Force
+                    Remove-Item $sqlPath -Force -ErrorAction SilentlyContinue
+                    $finalPath = $zipPath
+                }
+
+                if ($RetentionDays -gt 0) {
+                    $cutoff = (Get-Date).AddDays(-$RetentionDays)
+                    Get-ChildItem -Path $OutputFolder -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -lt $cutoff -and ($_.Extension -in ".sql",".zip") } |
+                        ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch { } }
+                }
+
+                return $finalPath
+            }
+
+            try {
+                $plainPwd = $null
+                if ($state.Cred -and $state.Cred.Password) {
+                    $plainPwd = Convert-SecureStringToPlain $state.Cred.Password
+                }
+
+                $skipped = @()
+                $accessible = New-Object System.Collections.Generic.List[string]
+
+                foreach ($schema in $state.CandidateSchemas) {
+                    $r = Test-DbAccess -MySqlExePath $state.Db.MySqlExe -DbHost $state.Db.DbHost -Port $state.Db.Port -User $state.Db.User -PlainPwd $plainPwd -DatabaseName $schema
+                    if ($r.Ok) { $accessible.Add($schema) }
+                    else {
+                        $msg = $r.Err
+                        if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "Not accessible." }
+                        $skipped += "Skipping '$schema' (not accessible). $msg"
+                    }
+                }
+
+                if ($accessible.Count -lt 1) { throw "No accessible databases found. Nothing to back up." }
+
+                $final = Backup-DatabaseInline `
+                    -MySqlDumpPath $state.Db.MySqlDump `
+                    -DbHost $state.Db.DbHost `
+                    -Port $state.Db.Port `
+                    -User $state.Db.User `
+                    -PlainPwd $plainPwd `
+                    -Databases $accessible.ToArray() `
+                    -OutputFolder $state.OutFolder `
+                    -FilePrefix "Legion" `
+                    -Compress:($state.DoZip) `
+                    -RetentionDays $state.RetentionDays `
+                    -ExtraArgs "--single-transaction --routines --events --triggers --quick --default-character-set=utf8mb4"
+
+                [pscustomobject]@{
+                    Ok         = $true
+                    FinalPath  = $final
+                    Accessible = $accessible.ToArray()
+                    Skipped    = $skipped
+                }
+            }
+            catch {
+                [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+            }
+        }
+
+        $state = @{
+            Db               = $db
+            Cred             = $cred
+            OutFolder        = $outFolder
+            RetentionDays    = $retentionDays
+            DoZip            = $doZip
+            CandidateSchemas = $candidateSchemas
+        }
+
+        $null = $ps.AddScript($script).AddArgument($state)
+
+# Start async pipeline
+$async = $ps.BeginInvoke()
+
+# Store a job bag in script-scope so the timer always has the right references
+$script:DbBackupJob = [pscustomobject]@{
+    PS        = $ps
+    RS        = $rs
+    Async     = $async
+    Dispatcher= $disp
+}
+
+# Ensure we don't accumulate old timers/handlers
+try {
+    if ($script:DbBackupTimer) {
+        $script:DbBackupTimer.Stop()
+        $script:DbBackupTimer = $null
+    }
+} catch { }
+
+$script:DbBackupTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:DbBackupTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+
+$script:DbBackupTimer.Add_Tick({
+    # Always guard timer tick; never let exceptions bubble
+    try {
+        $job = $script:DbBackupJob
+        if (-not $job) { return }
+
+        # IMPORTANT: Use the wait handle, not IsCompleted (more reliable in PS 5.1)
+        if (-not $job.Async.AsyncWaitHandle.WaitOne(0)) { return }
+
+        # Stop timer immediately to prevent re-entrancy
+        try { $script:DbBackupTimer.Stop() } catch { }
+
+        $result = $null
+        try {
+            $result = $job.PS.EndInvoke($job.Async) | Select-Object -First 1
+        }
+        catch {
+            $endErr = $_.Exception.Message
+            try {
+                Add-GuiLog "DB backup failed (EndInvoke): $endErr"
+                try { $TxtDbBackupStatus.Text = "Backup failed." } catch { }
+            } finally {
+                try { Set-DbBackupUiState -IsBusy $false -StatusText "Backup failed." } catch { }
+            }
+
+            # Cleanup
+            try { $job.PS.Dispose() } catch { }
+            try { $job.RS.Close() } catch { }
+            try { $job.RS.Dispose() } catch { }
+            $script:DbBackupJob = $null
+            return
+        }
+
+        # Process results on UI thread (we are already on UI thread via DispatcherTimer)
+        try {
+            if ($result -and $result.Ok) {
+                foreach ($line in ($result.Skipped | Where-Object { $_ })) {
+                    Add-GuiLog "Backup: $line"
+                }
+                Add-GuiLog ("Backup: Completed. Output: {0}" -f $result.FinalPath)
+                $TxtDbBackupStatus.Text = "Backup completed."
+            }
+            else {
+                $err = if ($result) { $result.Error } else { "Unknown error." }
+                Add-GuiLog "DB backup failed: $err"
+                $TxtDbBackupStatus.Text = "Backup failed."
+            }
+        }
+        finally {
+            # Always unlock UI
+            try { Set-DbBackupUiState -IsBusy $false -StatusText ($TxtDbBackupStatus.Text + "") } catch { }
+
+            # Cleanup runspace/PowerShell
+            try { $job.PS.Dispose() } catch { }
+            try { $job.RS.Close() } catch { }
+            try { $job.RS.Dispose() } catch { }
+
+            $script:DbBackupJob = $null
+        }
+    }
+    catch {
+        # Last-chance guard: never let timer tick exceptions bubble
+        try { Add-GuiLog "DB backup failed (timer outer): $($_.Exception.Message)" } catch { }
+        try { Set-DbBackupUiState -IsBusy $false -StatusText "Backup failed." } catch { }
+
+        # Best-effort cleanup
+        try {
+            $job = $script:DbBackupJob
+            if ($job) {
+                try { $job.PS.Dispose() } catch { }
+                try { $job.RS.Close() } catch { }
+                try { $job.RS.Dispose() } catch { }
+            }
+        } catch { }
+        $script:DbBackupJob = $null
+
+        try { $script:DbBackupTimer.Stop() } catch { }
+    }
+})
+
+$script:DbBackupTimer.Start()
+
+    }
+    catch {
+        Add-GuiLog "DB backup failed: $($_.Exception.Message)"
+        try { Set-DbBackupUiState -IsBusy $false -StatusText "Backup failed." } catch { }
+    }
+})
+
+# -------- Run Restore (PS 5.1 safe async runspace + UI progress) --------
+$BtnRunDbRestore.Add_Click({
+    try {
+        # Lock UI + show progress immediately
+        Set-DbRestoreUiState -IsBusy $true -StatusText "Starting restore… please wait."
+        Add-GuiLog "Restore: Initializing…"
+
+        # Force WPF to render the above changes before we do anything else
+        try {
+            $null = $Window.Dispatcher.Invoke([System.Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        } catch { }
+
+        $db = Get-DbConfig
+
+        $inputFile = ($TxtDbRestoreFile.Text + "").Trim()
+        if ([string]::IsNullOrWhiteSpace($inputFile) -or -not (Test-Path -LiteralPath $inputFile)) {
+            Add-GuiLog "Restore: Please select a valid .sql or .zip file."
+            Set-DbRestoreUiState -IsBusy $false -StatusText "Restore cancelled."
+            return
+        }
+
+        if (-not $ChkDbRestoreConfirm.IsChecked) {
+            Add-GuiLog "Restore: Confirmation checkbox is not checked. Restore cancelled."
+            Set-DbRestoreUiState -IsBusy $false -StatusText "Restore cancelled."
+            return
+        }
+
+        if (-not (Test-Path -LiteralPath $db.MySqlExe)) {
+            Add-GuiLog "Restore: mysql.exe not found at: $($db.MySqlExe)"
+            Set-DbRestoreUiState -IsBusy $false -StatusText "Restore failed."
+            return
+        }
+
+        $cred = $null
+        if ($db.PasswordSecure -and $db.PasswordSecure.Length -gt 0) {
+            $cred = [pscredential]::new($db.User, $db.PasswordSecure)
+        }
+
+        # ---- Dedicated background runspace ----
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.ApartmentState = 'MTA'
+        $rs.ThreadOptions  = 'ReuseThread'
+        $rs.Open()
+
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.Runspace = $rs
+
+        # IMPORTANT: the runspace does NOT automatically know your functions
+        $fnRestore = ${function:Restore-DatabaseMulti}.Ast.Extent.Text
+        $null = $ps.AddScript($fnRestore)
+
+        $worker = {
+            param($state)
+
+            try {
+                $r = Restore-DatabaseMulti `
+                    -MySqlPath $state.MySqlPath `
+                    -DbHost $state.DbHost `
+                    -Port $state.Port `
+                    -User $state.User `
+                    -Credential $state.Cred `
+                    -InputFile $state.InputFile `
+                    -CreateIfMissing:($state.CreateIfMissing) `
+                    -Force:($state.Force) `
+                    -ExtraArgs $state.ExtraArgs
+
+                # If Restore-DatabaseMulti returns only $true, DbList will be null (that's OK)
+                $dbList = $null
+                if ($r -is [pscustomobject] -and $r.PSObject.Properties.Match("DbList").Count -gt 0) {
+                    $dbList = @($r.DbList | ForEach-Object { "$_" })
+                }
+
+                [pscustomobject]@{ Ok=$true; DbList=$dbList }
+            }
+            catch {
+                [pscustomobject]@{ Ok=$false; Error=$_.Exception.Message }
+            }
+        }
+
+        $state = @{
+            MySqlPath       = $db.MySqlExe
+            DbHost          = $db.DbHost
+            Port            = $db.Port
+            User            = $db.User
+            Cred            = $cred
+            InputFile       = $inputFile
+            CreateIfMissing = $true
+            Force           = $true
+            ExtraArgs       = "--default-character-set=utf8mb4"
+        }
+
+        $null  = $ps.AddScript($worker).AddArgument($state)
+        $async = $ps.BeginInvoke()
+
+        # Store job for timer
+        $script:DbRestoreJob = [pscustomobject]@{
+            PS    = $ps
+            RS    = $rs
+            Async = $async
+        }
+
+        # Stop any prior timer
+        try {
+            if ($script:DbRestoreTimer) {
+                $script:DbRestoreTimer.Stop()
+                $script:DbRestoreTimer = $null
+            }
+        } catch { }
+
+        $script:DbRestoreTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:DbRestoreTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+
+        $script:DbRestoreTimer.Add_Tick({
+            try {
+                $job = $script:DbRestoreJob
+                if (-not $job) { return }
+
+                if (-not $job.Async.AsyncWaitHandle.WaitOne(0)) { return }
+
+                # stop first to prevent re-entrancy
+                try { $script:DbRestoreTimer.Stop() } catch { }
+
+                $result = $null
+                try {
+                    $result = $job.PS.EndInvoke($job.Async) | Select-Object -First 1
+                }
+                catch {
+                    Add-GuiLog "DB restore failed (EndInvoke): $($_.Exception.Message)"
+                    Set-DbRestoreUiState -IsBusy $false -StatusText "Restore failed."
+                    return
+                }
+                finally {
+                    # Always cleanup the runspace
+                    try { $job.PS.Dispose() } catch { }
+                    try { $job.RS.Close() } catch { }
+                    try { $job.RS.Dispose() } catch { }
+                    $script:DbRestoreJob = $null
+                }
+
+                # UI-thread updates
+                if ($result -and $result.Ok) {
+                    if ($result.DbList) {
+                        $TxtDbRestoreDatabases.Text = ($result.DbList -join ", ")
+                    }
+                    Add-GuiLog ("Restore: Completed. Databases: {0}" -f (($TxtDbRestoreDatabases.Text + "").Trim()))
+                    Set-DbRestoreUiState -IsBusy $false -StatusText "Restore completed."
+                }
+                else {
+                    $err = if ($result) { $result.Error } else { "Unknown error." }
+                    Add-GuiLog "DB restore failed: $err"
+                    Set-DbRestoreUiState -IsBusy $false -StatusText "Restore failed."
+                }
+            }
+            catch {
+                Add-GuiLog "DB restore failed (timer outer): $($_.Exception.Message)"
+                try { Set-DbRestoreUiState -IsBusy $false -StatusText "Restore failed." } catch { }
+                try { $script:DbRestoreTimer.Stop() } catch { }
+                $script:DbRestoreJob = $null
+            }
+        })
+
+        $script:DbRestoreTimer.Start()
+
+        # Update status text (still locked)
+        Set-DbRestoreUiState -IsBusy $true -StatusText "Restore running…"
+    }
+    catch {
+        Add-GuiLog "DB restore failed: $($_.Exception.Message)"
+        try { Set-DbRestoreUiState -IsBusy $false -StatusText "Restore failed." } catch { }
+    }
+})
+
+# =================================================
+# Broad Helpers (UI, Identity, Roles, NTFY)
+# Paste after controls are assigned.
+# =================================================
+
+function Invoke-Ui {
+    param([Parameter(Mandatory)][scriptblock]$Action)
+    if ($null -eq $Window) { & $Action; return }
+    try { $Window.Dispatcher.Invoke([action]$Action) } catch { & $Action }
+}
+
+function Get-TextSafe {
+    param($Control, [string]$Default = "")
+    try {
+        if ($null -eq $Control) { return $Default }
+        # TextBox
+        if ($Control.PSObject.Properties.Match("Text").Count -gt 0) {
+            $t = [string]$Control.Text
+            if ([string]::IsNullOrWhiteSpace($t)) { return $Default }
+            return $t
+        }
+        return $Default
+    } catch { return $Default }
+}
+
+function Get-PasswordSecure {
+    param(
+        [Parameter(Mandatory)]
+        [System.Windows.Controls.PasswordBox]$PwdBox
+    )
+
+    try {
+        $sec = $PwdBox.SecurePassword
+        if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+        return $sec
+    } catch {
+        return $null
+    }
+}
+
+function Get-MySqlCredentialFromPasswordBox {
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][System.Windows.Controls.PasswordBox]$PwdBox
+    )
+
+    try {
+        $sec = Get-PasswordSecure -PasswordBox $PwdBox
+        if ($null -eq $sec) { return $null }
+        return [pscredential]::new($UserName, $sec)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Set-TextSafe {
+    param($Control, [string]$Value)
+    Invoke-Ui {
+        try {
+            if ($null -ne $Control -and $Control.PSObject.Properties.Match("Text").Count -gt 0) {
+                $Control.Text = $Value
+            }
+        } catch { }
+    }
+}
+
+function Get-ComboSelectedText {
+    param([System.Windows.Controls.ComboBox]$Combo, [string]$Default = "")
+    try {
+        if ($null -eq $Combo -or $null -eq $Combo.SelectedItem) { return $Default }
+        $item = $Combo.SelectedItem
+        if ($item -is [System.Windows.Controls.ComboBoxItem]) {
+            $c = [string]$item.Content
+            if ([string]::IsNullOrWhiteSpace($c)) { return $Default }
+            return $c
+        }
+        $s = [string]$item
+        if ([string]::IsNullOrWhiteSpace($s)) { return $Default }
+        return $s
+    } catch { return $Default }
+}
+
+function Get-PrimaryIPv4Safe {
+    try {
+        $ip = Get-NetIPAddress -AddressFamily IPv4 -InterfaceOperationalStatus Up -ErrorAction Stop |
+            Where-Object { $_.IPAddress -and $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254*" } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        if ($ip) { return $ip }
+    } catch { }
+    return "Unknown"
+}
+
+function Get-WowIdentity {
+    # Cached identity + server name resolution
+    if (-not $global:WowWatchdogIdentity) {
+        $global:WowWatchdogIdentity = [pscustomobject]@{
+            Hostname  = $env:COMPUTERNAME
+            IPAddress = (Get-PrimaryIPv4Safe)
+        }
+    }
+
+    $serverName = ""
+    try { $serverName = [string]$Config.ServerName } catch { $serverName = "" }
+    if ([string]::IsNullOrWhiteSpace($serverName)) { $serverName = $global:WowWatchdogIdentity.Hostname }
+
+    [pscustomobject]@{
+        ServerName = $serverName
+        Hostname   = $global:WowWatchdogIdentity.Hostname
+        IPAddress  = $global:WowWatchdogIdentity.IPAddress
+    }
+}
+
+function Get-ExpansionLabel {
+    $exp = Get-ComboSelectedText -Combo $CmbExpansion -Default "Unknown"
+    if ($exp -eq "Custom") {
+        $custom = (Get-TextSafe -Control $TxtExpansionCustom -Default "Custom").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($custom)) { return $custom }
+        return "Custom"
+    }
+    if ([string]::IsNullOrWhiteSpace($exp)) { return "Unknown" }
+    return $exp
+}
+
+function Get-NtfyEndpoint {
+    $server = (Get-TextSafe -Control $TxtNtfyServer).Trim().TrimEnd('/')
+    $topic  = (Get-TextSafe -Control $TxtNtfyTopic).Trim().Trim('/')
+    if ([string]::IsNullOrWhiteSpace($server) -or [string]::IsNullOrWhiteSpace($topic)) { return $null }
+    return "$server/$topic"
+}
+
+function Get-NtfyPriorityForService {
+    param([Parameter(Mandatory)][ValidateSet("MySQL","Authserver","Worldserver","Test")][string]$ServiceName)
+
+    $prio = 4
+    $globalPrioStr = Get-ComboSelectedText -Combo $CmbNtfyPriorityDefault -Default "4"
+    [void][int]::TryParse($globalPrioStr, [ref]$prio)
+    if ($prio -lt 1 -or $prio -gt 5) { $prio = 4 }
+
+    # Service override
+    $override = "Auto"
+    switch ($ServiceName) {
+        "MySQL"       { $override = Get-ComboSelectedText -Combo $CmbPriMySQL -Default "Auto" }
+        "Authserver"  { $override = Get-ComboSelectedText -Combo $CmbPriAuthserver -Default "Auto" }
+        "Worldserver" { $override = Get-ComboSelectedText -Combo $CmbPriWorldserver -Default "Auto" }
+        default       { $override = "Auto" }
+    }
+
+    if ($override -and $override -ne "Auto") {
+        $o = 0
+        if ([int]::TryParse($override, [ref]$o) -and $o -ge 1 -and $o -le 5) { $prio = $o }
+    }
+    return $prio
+}
+
+function Get-NtfyTags {
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$StateTag  # "up"/"down"/"test"
+    )
+
+    $tags = New-Object System.Collections.Generic.List[string]
+
+    $raw = (Get-TextSafe -Control $TxtNtfyTags).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        foreach ($t in ($raw -split ",")) {
+            $tt = $t.Trim()
+            if ($tt) { [void]$tags.Add($tt) }
+        }
+    }
+
+    $exp = (Get-ExpansionLabel).ToLowerInvariant()
+    [void]$tags.Add("wow")
+    [void]$tags.Add($exp)
+    [void]$tags.Add($ServiceName.ToLowerInvariant())
+    [void]$tags.Add($StateTag.ToLowerInvariant())
+
+    (($tags | Where-Object { $_ } | Select-Object -Unique) -join ",")
+}
+
+function Send-NtfyMessage {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][int]$Priority,
+        [Parameter(Mandatory)][string]$TagsCsv
+    )
+
+    $url = Get-NtfyEndpoint
+    if (-not $url) { return $false }
+
+    $headers = @{
+        "Title"    = $Title
+        "Priority" = "$Priority"
+        "Tags"     = $TagsCsv
+    }
+
+    $mode     = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
+    $username = (Get-TextSafe -Control $TxtNtfyUsername)
+
+    # Prefer the live UI boxes, but fall back to the DPAPI secrets store (so auth survives app restarts)
+    $passwordSecure = Get-PasswordSecure -PwdBox $TxtNtfyPassword
+    if ($null -eq $passwordSecure -or $passwordSecure.Length -eq 0) {
+        $plain = Get-NtfySecret -Kind "BasicPassword"
+        if (-not [string]::IsNullOrWhiteSpace($plain)) {
+            $passwordSecure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+        }
+    }
+
+    $tokenSecure = Get-PasswordSecure -PwdBox $TxtNtfyToken
+    if ($null -eq $tokenSecure -or $tokenSecure.Length -eq 0) {
+        $plain = Get-NtfySecret -Kind "Token"
+        if (-not [string]::IsNullOrWhiteSpace($plain)) {
+            $tokenSecure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+        }
+    }
+
+    $cred = $null
+    if ($mode -eq "Basic (User/Pass)" -and
+        -not [string]::IsNullOrWhiteSpace($username) -and
+        $passwordSecure -and $passwordSecure.Length -gt 0) {
+
+        $cred = [pscredential]::new($username, $passwordSecure)
+    }
+
+    $authHeaders = Get-NtfyAuthHeaders `
+        -Mode $mode `
+        -Username $username `
+        -Credential $cred `
+        -TokenSecure $tokenSecure
+
+    foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
+
+    Invoke-RestMethod -Uri $url -Method Post -Body $Body -Headers $headers -ErrorAction Stop | Out-Null
+    return $true
+}
+
+function Role-IsHeld {
+    param([Parameter(Mandatory)][ValidateSet("MySQL","Authserver","Worldserver")][string]$Role)
+    try {
+        $p = Get-HoldFilePath -Role $Role
+        return (Test-Path -LiteralPath $p)
+    } catch { return $false }
+}
 
 function Update-UpdateIndicator {
     try {
@@ -2161,7 +4356,7 @@ function Stop-WatchdogPreferred {
     try {
         # Ask watchdog loop to gracefully stop roles
         New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null
-        Add-GuiLog "Stop signal written. Requesting service stop..."
+        Add-GuiLog "Stop signal written. Requesting service stop."
 
         if ($svc.Status -ne 'Stopped') {
             Stop-Service -Name $ServiceName -ErrorAction Stop
@@ -2247,7 +4442,7 @@ function Start-InnoUpdateFromUrl {
     }
 
     # Launch Inno installer silently
-    $args = @(
+    $installerargs = @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -2257,7 +4452,7 @@ function Start-InnoUpdateFromUrl {
     try {
         $sp = @{
             FilePath         = $tempPath
-            ArgumentList     = $args
+            ArgumentList     = $installerargs
             WorkingDirectory = (Split-Path $tempPath)
         }
 
@@ -2461,61 +4656,46 @@ function Update-ResourceUtilizationUi {
 
 
 # -------------------------------------------------
-# NTFY auth header helper
+# NTFY auth header helpers
 # -------------------------------------------------
+function ConvertFrom-SecureStringPlain {
+    param([Parameter(Mandatory)][Security.SecureString]$Secure)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
 function Get-NtfyAuthHeaders {
     param(
-        [string]$Mode,
+        [Parameter(Mandatory)][string]$Mode,
         [string]$Username,
-        [string]$Password,
-        [string]$Token
+        [pscredential]$Credential,
+        [Security.SecureString]$TokenSecure
     )
 
-    $headers = @{}
-    $m = ""
-    if ($Mode) { $m = $Mode.Trim() }
+    $h = @{}
 
-    switch ($m) {
-        "None" { return $headers }
-
+    switch ($Mode) {
         "Basic (User/Pass)" {
-            $u = ""
-            if ($Username) { $u = $Username.Trim() }
-
-            $pw = ""
-            if (-not [string]::IsNullOrWhiteSpace($Password)) {
-                $pw = $Password
-            } else {
-                $pw = Get-NtfySecret -Kind "BasicPassword"
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($u) -and -not [string]::IsNullOrWhiteSpace($pw)) {
-                $pair = "{0}:{1}" -f $u, $pw
+            if ($Credential) {
+                $pair = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
                 $b64  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
-                $headers["Authorization"] = "Basic $b64"
+                $h["Authorization"] = "Basic $b64"
             }
-            return $headers
         }
-
-        "Token (Bearer)" {
-            $tk = ""
-            if (-not [string]::IsNullOrWhiteSpace($Token)) {
-                $tk = $Token
-            } else {
-                $tk = Get-NtfySecret -Kind "Token"
+        "Bearer Token" {
+            if ($TokenSecure -and $TokenSecure.Length -gt 0) {
+                $token = ConvertFrom-SecureStringPlain -Secure $TokenSecure
+                $h["Authorization"] = "Bearer $token"
             }
-
-            if (-not [string]::IsNullOrWhiteSpace($tk)) {
-                $headers["Authorization"] = "Bearer $tk"
-            }
-            return $headers
-        }
-
-        default {
-            # Unknown -> treat as None
-            return $headers
         }
     }
+
+    return $h
 }
 
 # -------------------------------------------------
@@ -2537,6 +4717,33 @@ function Add-GuiLog {
         $TxtLiveLog.ScrollToEnd()
     })
 }
+
+# -------------------------------------------------
+# Last-chance exception logging (helps diagnose CTD)
+# -------------------------------------------------
+try {
+    [System.AppDomain]::CurrentDomain.add_UnhandledException({
+        param($errorsender, $e)
+        try {
+            $ex = $e.ExceptionObject
+            if ($ex) {
+                Add-GuiLog ("FATAL: Unhandled exception: {0}`r`n{1}" -f $ex.Message, $ex.StackTrace)
+            } else {
+                Add-GuiLog "FATAL: Unhandled exception (no ExceptionObject)."
+            }
+        } catch { }
+    })
+} catch { }
+
+try {
+    [System.Windows.Application]::Current.DispatcherUnhandledException += {
+        param($errorsender, $e)
+        try {
+            Add-GuiLog ("FATAL: DispatcherUnhandledException: {0}`r`n{1}" -f $e.Exception.Message, $e.Exception.StackTrace)
+        } catch { }
+        # Let it crash after logging (do not set $e.Handled = $true unless you want to suppress)
+    }
+} catch { }
 
 # -------------------------------------------------
 # Watchdog Command helper
@@ -2665,20 +4872,13 @@ function Send-NTFYAlert {
     )
 
     # Baseline must be set
-    if (-not $global:NtfyBaselineInitialized) {
-        return
-    }
+    if (-not $global:NtfyBaselineInitialized) { return }
 
-    # Suppression window (hybrid behavior)
-    if ($global:NtfySuppressUntil -and (Get-Date) -lt $global:NtfySuppressUntil) {
-        return
-    }
+    # Suppression window
+    if ($global:NtfySuppressUntil -and (Get-Date) -lt $global:NtfySuppressUntil) { return }
 
     # Require server + topic
-    if ([string]::IsNullOrWhiteSpace($TxtNtfyServer.Text) -or
-        [string]::IsNullOrWhiteSpace($TxtNtfyTopic.Text)) {
-        return
-    }
+    if (-not (Get-NtfyEndpoint)) { return }
 
     $sendOnDown = [bool]$ChkNtfyOnDown.IsChecked
     $sendOnUp   = [bool]$ChkNtfyOnUp.IsChecked
@@ -2691,107 +4891,27 @@ function Send-NTFYAlert {
 
     # Per-service enable switches
     switch ($ServiceName) {
-        "MySQL"      { if (-not $ChkNtfyMySQL.IsChecked) { return } }
-        "Authserver" { if (-not $ChkNtfyAuthserver.IsChecked) { return } }
-        "Worldserver"{ if (-not $ChkNtfyWorldserver.IsChecked) { return } }
+        "MySQL"       { if (-not $ChkNtfyMySQL.IsChecked) { return } }
+        "Authserver"  { if (-not $ChkNtfyAuthserver.IsChecked) { return } }
+        "Worldserver" { if (-not $ChkNtfyWorldserver.IsChecked) { return } }
     }
 
-    function Get-ComboContent {
-        param([System.Windows.Controls.ComboBox]$Combo)
-        $item = $Combo.SelectedItem
-        if (-not $item) { return "" }
-        return [string]$item.Content
-    }
-
-    function Get-ExpansionCurrent {
-        $sel = $CmbExpansion.SelectedItem
-        $exp = if ($sel) { [string]$sel.Content } else { "" }
-        if ($exp -eq "Custom") {
-            $exp = $TxtExpansionCustom.Text.Trim()
-        }
-        if ([string]::IsNullOrWhiteSpace($exp)) { $exp = "Unknown" }
-        return $exp
-    }
-
-    function Get-PrimaryIPv4 {
-        try {
-            $ip = Get-NetIPAddress -AddressFamily IPv4 -InterfaceOperationalStatus Up -ErrorAction Stop |
-                Where-Object { $_.IPAddress -and $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254*" } |
-                Select-Object -First 1 -ExpandProperty IPAddress
-            if ($ip) { return $ip }
-        } catch { }
-        return "Unknown"
-    }
-
-    # Cached identity (resolve once)
-    if (-not $global:WowWatchdogIdentity) {
-        $global:WowWatchdogIdentity = [pscustomobject]@{
-            Hostname   = $env:COMPUTERNAME
-            IPAddress  = (Get-PrimaryIPv4)
-        }
-    }
-
-    $expansion = Get-ExpansionCurrent
-    $hostname  = $global:WowWatchdogIdentity.Hostname
-    $ipaddr    = $global:WowWatchdogIdentity.IPAddress
-    $serverName = [string]$Config.ServerName
-    if ([string]::IsNullOrWhiteSpace($serverName)) { $serverName = $hostname }
-
-    $prev = if ($OldState) { "UP" } else { "DOWN" }
-    $curr = if ($NewState) { "UP" } else { "DOWN" }
-    $ts   = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-
-    $server = $TxtNtfyServer.Text.TrimEnd('/')
-    $topic  = $TxtNtfyTopic.Text.Trim('/')
-    $url    = "$server/$topic"
-
-    # Priority (global default + per-service override)
-    $prio = 4
-    $globalPrioStr = Get-ComboContent $CmbNtfyPriorityDefault
-    [void][int]::TryParse($globalPrioStr, [ref]$prio)
-    if ($prio -lt 1 -or $prio -gt 5) { $prio = 4 }
-
-    $override = "Auto"
-    switch ($ServiceName) {
-        "MySQL"      { $override = Get-ComboContent $CmbPriMySQL }
-        "Authserver" { $override = Get-ComboContent $CmbPriAuthserver }
-        "Worldserver"{ $override = Get-ComboContent $CmbPriWorldserver }
-    }
-    if ($override -and $override -ne "Auto") {
-        $o = 0
-        if ([int]::TryParse($override, [ref]$o) -and $o -ge 1 -and $o -le 5) {
-            $prio = $o
-        }
-    }
-
-    # Tags (merge GUI tags + dynamic tags)
-    $tagList = New-Object System.Collections.Generic.List[string]
-    $rawTags = [string]$TxtNtfyTags.Text
-    if (-not [string]::IsNullOrWhiteSpace($rawTags)) {
-        foreach ($t in ($rawTags -split ",")) {
-            $tt = $t.Trim()
-            if ($tt) { $tagList.Add($tt) }
-        }
-    }
-    $tagList.Add("wow")
-    $tagList.Add(($expansion.ToLower()))
-    $tagList.Add(($ServiceName.ToLower()))
-    $tagList.Add(($curr.ToLower()))
-
-    # Unique tags
-    $tagsUnique = ($tagList | Where-Object { $_ } | Select-Object -Unique)
-    $tagsHeader = ($tagsUnique -join ",")
+    $exp      = Get-ExpansionLabel
+    $id       = Get-WowIdentity
+    $prev     = if ($OldState) { "UP" } else { "DOWN" }
+    $curr     = if ($NewState) { "UP" } else { "DOWN" }
+    $ts       = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
 
     $titleState = if ($curr -eq "DOWN") { "DOWN" } else { "RECOVERED" }
-    $title = "[WoW Watchdog] $ServiceName $titleState ($expansion)"
+    $title = "[WoW Watchdog] $ServiceName $titleState ($exp)"
 
-    $message = @"
+    $body = @"
 WoW Watchdog alert
 
-Server: $serverName
-Host:   $hostname
-IP:     $ipaddr
-Expansion: $expansion
+Server: $($id.ServerName)
+Host:   $($id.Hostname)
+IP:     $($id.IPAddress)
+Expansion: $exp
 
 Service: $ServiceName
 Previous state: $prev
@@ -2799,30 +4919,16 @@ New state: $curr
 Timestamp: $ts
 "@
 
+    $prio = Get-NtfyPriorityForService -ServiceName $ServiceName
+    $tags = Get-NtfyTags -ServiceName $ServiceName -StateTag ($curr.ToLowerInvariant())
+    
+    # Optional: suppress DOWN notifications if role is manually held
+    if ($curr -eq "DOWN" -and (Role-IsHeld -Role $ServiceName)) {
+        return
+    }
+
     try {
-$headers = @{
-    "Title"    = $title
-    "Priority" = "$prio"
-    "Tags"     = $tagsHeader
-}
-
-# Auth: None / Basic / Token
-$mode = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
-
-$username = ""
-if ($TxtNtfyUsername -and $TxtNtfyUsername.Text) { $username = [string]$TxtNtfyUsername.Text }
-
-$password = ""
-if ($TxtNtfyPassword) { $password = [string]$TxtNtfyPassword.Password }
-
-$token = ""
-if ($TxtNtfyToken) { $token = [string]$TxtNtfyToken.Password }   # PasswordBox
-
-$authHeaders = Get-NtfyAuthHeaders -Mode $mode -Username $username -Password $password -Token $token
-foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
-
-Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
-
+        [void](Send-NtfyMessage -Title $title -Body $body -Priority $prio -TagsCsv $tags)
         Add-GuiLog "Sent NTFY notification for $ServiceName state change ($prev -> $curr)."
     } catch {
         Add-GuiLog ("ERROR: Failed to send NTFY notification for {0}: {1}" -f $ServiceName, $_)
@@ -2830,86 +4936,33 @@ Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -Error
 }
 
 function Send-NTFYTest {
-    if ([string]::IsNullOrWhiteSpace($TxtNtfyServer.Text) -or
-        [string]::IsNullOrWhiteSpace($TxtNtfyTopic.Text)) {
+    if (-not (Get-NtfyEndpoint)) {
         Add-GuiLog "NTFY test failed: server or topic is empty."
         return
     }
 
-    $server = $TxtNtfyServer.Text.TrimEnd('/')
-    $topic  = $TxtNtfyTopic.Text.Trim('/')
-    $url    = "$server/$topic"
+    $exp = Get-ExpansionLabel
+    $id  = Get-WowIdentity
+    $ts  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
 
-    $expansion = "Unknown"
-    try {
-        $sel = $CmbExpansion.SelectedItem
-        $expansion = if ($sel) { [string]$sel.Content } else { "Unknown" }
-        if ($expansion -eq "Custom") {
-            $expansion = $TxtExpansionCustom.Text.Trim()
-            if ([string]::IsNullOrWhiteSpace($expansion)) { $expansion = "Custom" }
-        }
-    } catch { }
+    $title = "[WoW Watchdog] Test Notification ($exp)"
 
-    $hostname = $env:COMPUTERNAME
-    $ipaddr   = "Unknown"
-    try {
-        $ipaddr = Get-NetIPAddress -AddressFamily IPv4 -InterfaceOperationalStatus Up -ErrorAction Stop |
-            Where-Object { $_.IPAddress -and $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254*" } |
-            Select-Object -First 1 -ExpandProperty IPAddress
-        if (-not $ipaddr) { $ipaddr = "Unknown" }
-    } catch { }
-
-    $prio = 4
-    try {
-        $pItem = $CmbNtfyPriorityDefault.SelectedItem
-        if ($pItem) { [void][int]::TryParse([string]$pItem.Content, [ref]$prio) }
-        if ($prio -lt 1 -or $prio -gt 5) { $prio = 4 }
-    } catch { $prio = 4 }
-
-    $tags = "wow,watchdog,test"
-    $rawTags = [string]$TxtNtfyTags.Text
-    if (-not [string]::IsNullOrWhiteSpace($rawTags)) {
-        $tags = ($rawTags.Trim())
-    }
-
-    $title   = "[WoW Watchdog] Test Notification ($expansion)"
-    $ts      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-
-    $message = @"
+    $body = @"
 WoW Watchdog NTFY Test
 
-Host: $hostname
-IP:   $ipaddr
-Expansion: $expansion
+Server: $($id.ServerName)
+Host:   $($id.Hostname)
+IP:     $($id.IPAddress)
+Expansion: $exp
 Timestamp: $ts
 "@
 
+    $prio = Get-NtfyPriorityForService -ServiceName "Test"
+    # Preserve user tags but add test tag
+    $tags = Get-NtfyTags -ServiceName "Test" -StateTag "test"
+
     try {
-$headers = @{
-    "Title"    = $title
-    "Priority" = "$prio"
-    "Tags"     = $tags
-}
-
-# Auth: None / Basic / Token
-$mode = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
-
-$username = ""
-if ($TxtNtfyUsername -and $TxtNtfyUsername.Text) { $username = [string]$TxtNtfyUsername.Text }
-
-$password = ""
-if ($TxtNtfyPassword) { $password = [string]$TxtNtfyPassword.Password }
-
-$token = ""
-if ($TxtNtfyToken) { $token = [string]$TxtNtfyToken.Password }
-
-
-$authHeaders = Get-NtfyAuthHeaders -Mode $mode -Username $username -Password $password -Token $token
-foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
-
-Invoke-RestMethod -Uri $url -Method Post -Body $message -Headers $headers -ErrorAction Stop | Out-Null
-
-
+        [void](Send-NtfyMessage -Title $title -Body $body -Priority $prio -TagsCsv $tags)
         Add-GuiLog "Sent NTFY test notification."
     } catch {
         Add-GuiLog "ERROR: Failed to send NTFY test notification: $_"
@@ -3063,44 +5116,118 @@ $BtnSaveDbPassword.Add_Click({
 })
 
 $BtnUpdateNow.Add_Click({
-    try {
-        $Owner = "faustus1005"
-        $Repo  = "WoW-Watchdog"
 
-        $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
-        $latestVer = Parse-ReleaseVersion -TagName $rel.tag_name
+    $worker = New-Object System.ComponentModel.BackgroundWorker
+    $worker.WorkerReportsProgress = $false
 
-        $asset = $rel.assets | Where-Object { $_.name -eq "WoWWatchdog-Setup.exe" } | Select-Object -First 1
-        if ($null -eq $asset) {
-            $names = @()
-            if ($rel.assets) { $names = $rel.assets | ForEach-Object { $_.name } }
-            throw ("Could not find 'WoWWatchdog-Setup.exe' in latest release assets. Found: " + ($names -join ", "))
-        }
+    $worker.DoWork += {
+        try {
+            Set-UpdateButtonsEnabled -Enabled $false
+            Set-UpdateFlowUi -Text "Preparing update." -Percent 0 -Show $true -Indeterminate $true
 
-        # IMPORTANT: use browser_download_url, not asset.url/assets_url
-        $ok = Start-InnoUpdateFromUrl `
-            -InstallerUrl $asset.browser_download_url `
-            -LatestVersion $latestVer `
-            -ExpectedAssetName "WoWWatchdog-Setup.exe"
+            # Reuse your repo settings
+            $Owner = $RepoOwner
+            $Repo  = $RepoName
 
-        if ($ok) {
-            # Close the GUI so the installer can replace files
-            $app = [System.Windows.Application]::Current
-            if ($app -and $app.MainWindow) {
-                $app.MainWindow.Close()
-            } elseif ($app) {
-                $app.Shutdown()
+            # Pull latest release
+            Set-UpdateFlowUi -Text "Fetching latest release." -Percent 0 -Show $true -Indeterminate $true
+            $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
+            
+            # Find expected asset
+            $asset = $rel.assets | Where-Object { $_.name -eq "WoWWatchdog-Setup.exe" } | Select-Object -First 1
+            if (-not $asset) {
+                $names = @()
+                if ($rel.assets) { $names = $rel.assets | ForEach-Object { $_.name } }
+                throw "Could not find WoWWatchdog-Setup.exe in latest release. Found: $($names -join ', ')"
             }
+
+            # Step 1: Gracefully stop service
+            Set-UpdateFlowUi -Text "Stopping WoWWatchdog service (graceful)." -Percent 0 -Show $true -Indeterminate $true
+            try {
+                [void](Stop-ServiceAndWait -Name $ServiceName -TimeoutSeconds 45)
+            } catch {
+                # If stop fails, abort update (safer than updating binaries mid-run)
+                throw "Failed to stop service safely. $($_.Exception.Message)"
+            }
+
+            # Step 2: Download installer with progress
+            $tempInstaller = Join-Path $env:TEMP "WoWWatchdog-Setup.exe"
+            [void](Download-FileWithProgress -Url $asset.browser_download_url -OutFile $tempInstaller)
+
+            # Optional sanity check on size (avoid HTML/403 pages)
+            $fi = Get-Item $tempInstaller -ErrorAction Stop
+            if ($fi.Length -lt 200000) { # 200KB floor, tune if needed
+                throw "Downloaded installer is unexpectedly small ($($fi.Length) bytes). Aborting."
+            }
+
+            # Step 3: Run installer
+            [void](Run-InstallerAndWait -InstallerPath $tempInstaller)
+
+            # Step 4: Prompt restart actions on UI thread
+            $Window.Dispatcher.Invoke([action]{
+                Set-UpdateFlowUi -Text "Update installed." -Percent 100 -Show $true -Indeterminate $false
+
+                $restartSvc = [System.Windows.MessageBox]::Show(
+                    "Update installed successfully.`n`nRestart the WoWWatchdog service now?",
+                    "Update Complete",
+                    [System.Windows.MessageBoxButton]::YesNo,
+                    [System.Windows.MessageBoxImage]::Question
+                )
+
+                if ($restartSvc -eq [System.Windows.MessageBoxResult]::Yes) {
+                    try {
+                        Set-UpdateFlowUi -Text "Starting WoWWatchdog service." -Percent 100 -Show $true -Indeterminate $true
+                        Start-ServiceAndWait -Name $ServiceName -TimeoutSeconds 30 | Out-Null
+                        Add-GuiLog "Service restarted after update."
+                    } catch {
+                        Add-GuiLog "ERROR: Service restart failed: $_"
+                        [System.Windows.MessageBox]::Show(
+                            "Update installed, but service restart failed:`n$($_.Exception.Message)",
+                            "Service Restart Failed",
+                            "OK",
+                            "Error"
+                        ) | Out-Null
+                    }
+                }
+
+                $restartGui = [System.Windows.MessageBox]::Show(
+                    "Restart the GUI now to ensure all updated files are loaded?",
+                    "Restart Recommended",
+                    [System.Windows.MessageBoxButton]::YesNo,
+                    [System.Windows.MessageBoxImage]::Question
+                )
+
+                if ($restartGui -eq [System.Windows.MessageBoxResult]::Yes) {
+                    try {
+                        # Relaunch same executable (works if packaged as exe)
+                        Start-Process -FilePath $ExePath -WorkingDirectory $ScriptDir | Out-Null
+                        $Window.Close()
+                    } catch {
+                        Add-GuiLog "ERROR: Failed to relaunch GUI: $_"
+                    }
+                }
+
+                Set-UpdateButtonsEnabled -Enabled $true
+                Set-UpdateFlowUi -Text "Ready." -Percent 0 -Show $false
+            })
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            $Window.Dispatcher.Invoke([action]{
+                Set-UpdateButtonsEnabled -Enabled $true
+                Set-UpdateFlowUi -Text ("Update failed: " + $errMsg) -Percent 0 -Show $true -Indeterminate $false
+
+                [System.Windows.MessageBox]::Show(
+                    $errMsg,
+                    "Update Failed",
+                    [System.Windows.MessageBoxButton]::OK,
+                    [System.Windows.MessageBoxImage]::Error
+                ) | Out-Null
+            })
         }
     }
-    catch {
-        [System.Windows.MessageBox]::Show(
-            $_.Exception.Message,
-            "Update Failed",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Error
-        ) | Out-Null
-    }
+
+    $worker.RunWorkerAsync()
 })
 
 $BtnMinimize.Add_Click({ $Window.WindowState = 'Minimized' })
@@ -3263,10 +5390,7 @@ $BtnLaunchSppManager.Add_Click({
         $owner = "skeezerbean"
         $repo  = "SPP-LegionV2-Management"
 
-        $dataRoot   = Get-WoWWatchdogDataFolder
-        $installDir = Join-Path $dataRoot "SPP-LegionV2-Management"
-
-        # Matches: SPP.LegionV2.Management.0.0.2.24.zip
+        $installDir = $script:ToolsDir  # Matches: SPP.LegionV2.Management.0.0.2.24.zip
         $assetRegex = '^SPP\.LegionV2\.Management\.\d+\.\d+\.\d+\.\d+\.zip$'
 
         # Confirmed extracted EXE location:

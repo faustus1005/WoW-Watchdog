@@ -58,3 +58,17 @@ New Feature:
  - App will be installed in %appdata%\wowwatchdog if it doesn't already exist there.
  - Once installed, you should use the update feature in the management app, my launcher will *not* update it.
  - If you already use the app, copy your config into the new folder so the launcher installed version has that data. (I may do some form of ingest for this down the road.)
+ 
+ ## v1.2.0 – Release
+ New Features:
+- Tools relocated to \programdata\wowwatcher\Tools (Easier to manage, my apologies if you were already using SPP Management tool in %appdata%)
+- Backup and restore for database has been added to the Tools tab.
+  - Select location for backups
+  - Compress (zip) by default
+  - Retention 14 days default
+  - SQL username/pass configured in Configuration tab
+  - Select sql/zip file for recovery
+- Battle Shop Editor added to Tools tab (Installed in program data.)
+
+Bug fixes:
+- Graceful shutdown of services is now maintained when using the self-update feature.

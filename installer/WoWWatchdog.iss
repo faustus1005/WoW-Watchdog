@@ -4,7 +4,7 @@
  
 [Setup]
 AppName=WoW Watchdog
-AppVersion=1.1.9
+AppVersion=1.2.0
 AppPublisher=WoW Watchdog Project
 DefaultDirName={commonpf32}\WoWWatchdog
 DefaultGroupName=WoW Watchdog
@@ -39,11 +39,16 @@ Source: "nssm.exe";       DestDir: "{app}"; Flags: ignoreversion
 ; Optional default config
 Source: "config.json"; DestDir: "{commonappdata}\WoWWatchdog"; Flags: onlyifdoesntexist ignoreversion
 
+; Tools folder (BattleShopEditor deps, 7zip CLI, etc.)
+Source: "Tools\*"; DestDir: "{app}\Tools"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 ; --------------------------------------------------
 ; Directories
 ; --------------------------------------------------
 [Dirs]
 Name: "{commonappdata}\WoWWatchdog"; Permissions: users-modify
+Name: "{app}\Tools"
+
 
 ; --------------------------------------------------
 ; Icons
