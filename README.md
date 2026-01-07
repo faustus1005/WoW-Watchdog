@@ -1,4 +1,4 @@
-# <p align="center">NOTE: The app update process has a bug in the current release. During the next update, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
+# <p align="center">NOTE: The app update process has a bug in the v1.1.9 release. Before updating to v1.2.0, ensure you stop your services gracefully, as the update process will forcefully kill them otherwise!</p>
 
 # <p align="center">🛡️ WoW-Watchdog</p>
 
@@ -26,6 +26,10 @@ This tool runs quietly in the background, periodically checking specified server
 *  **Self Updater**: App can update itself from the latest release.
 
 *  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
+
+*  **Database**: Backup and Restore Management
+
+*  **Tools**: SPP V2 Management Tool and BattlePay Editor download/install/launch
     
 *  **JSON-based Configuration**: Easy and flexible setup using a human-readable `config.json` file.
     
