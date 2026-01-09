@@ -59,7 +59,7 @@ New Feature:
  - Once installed, you should use the update feature in the management app, my launcher will *not* update it.
  - If you already use the app, copy your config into the new folder so the launcher installed version has that data. (I may do some form of ingest for this down the road.)
  
- ## v1.2.0 – Release
+## v1.2.0 – Release
  New Features:
 - Tools relocated to \programdata\wowwatcher\Tools (Easier to manage, my apologies if you were already using SPP Management tool in %appdata%)
 - Backup and restore for database has been added to the Tools tab.
@@ -73,10 +73,17 @@ New Feature:
 Bug fixes:
 - Graceful shutdown of services is now maintained when using the self-update feature.
 
- ## v1.2.1 – Minor Release
+## v1.2.1 – Minor Release
 - Server/Repack Full Backup functionality added.
   - Graceful stop of World->Auth->DB
   - Zip entire repack folder (specified in Repack Folder text box or browse button)
   - Once zip completed, attempt restart services. DB->Auth->World
 - Option to back up just the auth/world config files.
 
+## v1.2.2 – Feature Release
+- Worldserver Console tab added.
+  - RA console can now be configured and connected to, allowing you to pass commands to the server from the launcher.
+  - Console output visible in worldserver console tab.
+- Live Log now is only shown on Main tab, to allow for more space in the other tabs.
+- Several small bug fixes (hopefully including the auto update process!)
+- UI reconfiguration on Main tab. Buttons laid out in a more easy to read fashion, restart buttons added to each service.
