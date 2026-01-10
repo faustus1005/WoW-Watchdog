@@ -19,7 +19,7 @@ function Test-IsAdmin {
 
 if (-not (Test-IsAdmin)) {
 
-    # Relaunch
+    # Relaunch *this process*, not powershell.exe
     $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
     try {
@@ -88,10 +88,12 @@ function Write-JsonFile {
     $Object | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
-$AppVersion = [version]"1.2.1"
+$AppVersion = [version]"1.2.3"
 $RepoOwner  = "FAUSTUS1005"
 $RepoName   = "WoW-Watchdog"
 
+# -------------------------------------------------
+# Paths / constants
 # -------------------------------------------------
 # Canonical paths and globals
 # -------------------------------------------------
@@ -107,6 +109,7 @@ if (-not (Test-Path -LiteralPath $DataDir)) {
     New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
 }
 
+# Tools downloaded/installed by launchers MUST be writable without elevation.
 # Use ProgramData\WoWWatchdog\Tools (installer grants users-modify on the WoWWatchdog folder).
 $script:ToolsDir = Join-Path $DataDir "Tools"
 if (-not (Test-Path -LiteralPath $script:ToolsDir)) {
@@ -146,7 +149,18 @@ $DefaultConfig = [ordered]@{
     Authserver   = ""     # e.g. C:\WoWSrv\authserver.exe
     Worldserver  = ""     # e.g. C:\WoWSrv\worldserver.exe
 
+
+    # Worldserver Telnet console (in-GUI remote console)
+    WorldTelnetHost = "127.0.0.1"
+    WorldTelnetPort = 3443
+    WorldTelnetUser = ""
+
+    WorldserverLogPath = ""
+
     RepackRoot  = ""     # e.g. C:\WoWSrv (root folder to back up for full repack backups)
+    DbBackupFolder     = (Join-Path $DataDir "backups")
+    RepackBackupFolder = (Join-Path $DataDir "backups")
+
 
     # DB settings (non-secrets)
     DbHost       = "127.0.0.1"
@@ -219,6 +233,7 @@ function Ensure-UrlZipToolInstalled {
         # Exact expected EXE location after extraction (relative to InstallDir)
         [Parameter(Mandatory)][string]$ExeRelativePath,
 
+        # Optional: for nicer temp naming/logging
         [string]$ToolName = "Tool",
         [string]$TempZipFileName = "tool.zip"
     )
@@ -230,7 +245,7 @@ function Ensure-UrlZipToolInstalled {
     $exePath = Join-Path $InstallDir $ExeRelativePath
     if (Test-Path $exePath) { return $exePath }
 
-    # ensure TLS 1.2
+    # PS 5.1: ensure TLS 1.2
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
     $tempZip = Join-Path $env:TEMP $TempZipFileName
@@ -238,6 +253,7 @@ function Ensure-UrlZipToolInstalled {
     try {
         if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
 
+        # UseBasicParsing for PS 5.1
         Invoke-WebRequest -Uri $ZipUrl -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
     } catch {
         throw "Failed to download $ToolName from URL. $($_.Exception.Message)"
@@ -330,9 +346,14 @@ function Get-NtfySecretKey {
     try { $server = [string]$TxtNtfyServer.Text } catch { }
     try { $topic  = [string]$TxtNtfyTopic.Text } catch { }
 
-    if ([string]::IsNullOrWhiteSpace($server)) { $server = [string]$Config.NtfyServer }
-    if ([string]::IsNullOrWhiteSpace($topic))  { $topic  = [string]$Config.NtfyTopic  }
+    if ([string]::IsNullOrWhiteSpace($server)) {
+        try { $server = [string]$Config.NTFY.Server } catch { $server = "" }
+    }
+    if ([string]::IsNullOrWhiteSpace($topic)) {
+        try { $topic = [string]$Config.NTFY.Topic } catch { $topic = "" }
+    }
 
+    # PowerShell 5.1-safe null handling and normalization
     if ($null -eq $server) { $server = "" }
     if ($null -eq $topic)  { $topic  = "" }
 
@@ -424,6 +445,108 @@ function Remove-DbSecretPassword {
     }
 }
 
+# -------------------------------------------------
+# Worldserver Telnet password (DPAPI secret)
+# -------------------------------------------------
+function Get-WorldTelnetSecretKey {
+    param(
+        [string]$telnetHost,
+        [int]$Port,
+        [string]$Username
+    )
+
+    # Prefer explicit arguments, then UI, then persisted config
+    if ([string]::IsNullOrWhiteSpace($telnetHost)) {
+        try { $telnetHost = [string]$TxtWorldTelnetHost.Text } catch { $telnetHost = $null }
+        if ([string]::IsNullOrWhiteSpace($telnetHost)) {
+            try { $telnetHost = [string]$Config.WorldTelnetHost } catch { $telnetHost = "" }
+        }
+    }
+
+    if (-not $Port) {
+        try { $Port = [int]([string]$TxtWorldTelnetPort.Text) } catch { $Port = 0 }
+        if (-not $Port) {
+            try { $Port = [int]$Config.WorldTelnetPort } catch { $Port = 3443 }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Username)) {
+        try { $Username = [string]$TxtWorldTelnetUser.Text } catch { $Username = $null }
+        if ([string]::IsNullOrWhiteSpace($Username)) {
+            try { $Username = [string]$Config.WorldTelnetUser } catch { $Username = "" }
+        }
+    }
+
+    if ($null -eq $telnetHost) { $telnetHost = "" }
+    if ($null -eq $Username) { $Username = "" }
+
+    $telnetHost = $telnetHost.Trim()
+    if ([string]::IsNullOrWhiteSpace($telnetHost)) { $telnetHost = "127.0.0.1" }
+
+    if (-not $Port) { $Port = 3443 }
+
+    $Username = $Username.Trim()
+
+    # Key: bind to target + username so multiple servers/users can coexist
+    return ("WSTELNET::PASS::{0}@{1}:{2}" -f $Username.ToLowerInvariant(), $telnetHost.ToLowerInvariant(), $Port)
+}
+
+function Set-WorldTelnetPassword {
+    param(
+        [Parameter(Mandatory)][string]$telnetHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Plain
+    )
+
+    $store = Get-SecretsStore
+    $key   = Get-WorldTelnetSecretKey -TelnetHost $telnetHost -Port $Port -Username $Username
+    $store[$key] = Protect-Secret -Plain $Plain
+    Save-SecretsStore -Store $store
+}
+
+function Get-WorldTelnetPassword {
+    param(
+        [Parameter(Mandatory)][string]$telnetHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Username
+    )
+
+    $store = Get-SecretsStore
+    $key   = Get-WorldTelnetSecretKey -TelnetHost $telnetHost -Port $Port -Username $Username
+    if (-not $store.ContainsKey($key)) { return $null }
+
+    try { return (Unprotect-Secret -Protected $store[$key]) }
+    catch { return $null }
+}
+
+function Has-WorldTelnetPassword {
+    param(
+        [Parameter(Mandatory)][string]$telnetHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Username
+    )
+    $store = Get-SecretsStore
+    $key   = Get-WorldTelnetSecretKey -TelnetHost $telnetHost -Port $Port -Username $Username
+    return $store.ContainsKey($key)
+}
+
+function Remove-WorldTelnetPassword {
+    param(
+        [Parameter(Mandatory)][string]$telnetHost,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Username
+    )
+
+    $store = Get-SecretsStore
+    $key   = Get-WorldTelnetSecretKey -TelnetHost $telnetHost -Port $Port -Username $Username
+    if ($store.ContainsKey($key)) {
+        [void]$store.Remove($key)
+        Save-SecretsStore -Store $store
+    }
+}
+
+
 function Get-OnlinePlayerCount_Legion {
 
     # mysql.exe
@@ -461,7 +584,7 @@ function Get-OnlinePlayerCount_Legion {
         $dbNameChars = "legion_characters"
     }
 
-    # Query
+    # Query (confirmed schema)
     $query = "SELECT COUNT(*) FROM characters WHERE online=1;"
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -531,6 +654,7 @@ function Get-LatestReleaseAssetInfo {
         [Parameter(Mandatory)][string]$Owner,
         [Parameter(Mandatory)][string]$Repo,
 
+        # Use ONE of these:
         [string]$ExpectedAssetName,
         [string]$AssetNameRegex
     )
@@ -589,9 +713,10 @@ function Get-LatestGitHubRelease {
 
 function Get-7ZipCliPath {
     param(
-        # AppRoot defaults to the installed app folder
+        # AppRoot defaults to the installed app folder (where WoWWatcher.exe lives)
         [string]$AppRoot = $script:ScriptDir,
 
+        # Optional: also look in ProgramData tools deps if you choose to place it there
         [string]$DataToolsDir = $script:ToolsDir
     )
 
@@ -640,6 +765,7 @@ function Expand-ArchiveWith7Zip {
         New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
     }
 
+    # IMPORTANT: Use the call operator (&) to preserve arguments containing spaces (e.g., Program Files paths).
     $args = @(
         "x",                 # extract with full paths
         "-y",                # assume yes
@@ -715,8 +841,10 @@ function Ensure-GitHubZipToolInstalled {
         [Parameter(Mandatory)][string]$Repo,
         [Parameter(Mandatory)][string]$InstallDir,
 
+        # Strongly recommended if you know it:
         [string]$ExeRelativePath,
 
+        # Asset selection (regex)
         [Parameter(Mandatory)][string]$AssetNameRegex
     )
 
@@ -797,6 +925,31 @@ function Set-UpdateFlowUi {
         }
     })
 }
+
+function Set-SppV2UpdateUiState {
+    param(
+        [bool]$IsBusy,
+        [string]$StatusText = ""
+    )
+
+    if (-not $Window) { return }
+
+    $Window.Dispatcher.Invoke([action]{
+        if ($BtnSppV2RepackUpdate) { $BtnSppV2RepackUpdate.IsEnabled = (-not $IsBusy) }
+
+        if ($TxtSppV2UpdateStatus) {
+            $TxtSppV2UpdateStatus.Text = $StatusText
+            $TxtSppV2UpdateStatus.Visibility = $(if ([string]::IsNullOrWhiteSpace(($StatusText + ""))) { "Collapsed" } else { "Visible" })
+        }
+
+        if ($PbSppV2Update) {
+            $PbSppV2Update.Visibility = $(if ($IsBusy) { "Visible" } else { "Collapsed" })
+            $PbSppV2Update.IsIndeterminate = $IsBusy
+            if (-not $IsBusy) { $PbSppV2Update.Value = 0 }
+        }
+    })
+}
+
 
 function Set-UpdateButtonsEnabled {
     param([bool]$Enabled)
@@ -939,7 +1092,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WoW Watchdog"
-        Width="1920" Height="1080"
+        Width="900" Height="1200"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResizeWithGrip"
         Background="Transparent"
@@ -1134,13 +1287,7 @@ $xaml = @"
 
       <!-- Main -->
       <Grid Grid.Row="1" Margin="0,10,0,0">
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="*"/>
-        </Grid.RowDefinitions>
-
-<TabControl Grid.Row="0"
-            Margin="0,0,0,6"
+        <TabControl Margin="0,0,0,0"
             Background="#FF0D111A"
             BorderBrush="#FF2B3E5E"
             Foreground="White"
@@ -1150,7 +1297,14 @@ $xaml = @"
   <!-- TAB 1: Main                                       -->
   <!-- ================================================= -->
   <TabItem Header="Main">
-    <ScrollViewer VerticalScrollBarVisibility="Auto"
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="*" MinHeight="420"/>
+      <RowDefinition Height="6"/>
+      <RowDefinition Height="300" MinHeight="180"/>
+    </Grid.RowDefinitions>
+
+    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
                   HorizontalScrollBarVisibility="Disabled">
       <Grid>
         <Grid.RowDefinitions>
@@ -1174,74 +1328,104 @@ $xaml = @"
 
           <Grid Margin="10">
             <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/> <!-- Watchdog buttons -->
-              <RowDefinition Height="Auto"/> <!-- Per-service buttons -->
-              <RowDefinition Height="Auto"/> <!-- Start/Stop All -->
+              <RowDefinition Height="Auto"/> <!-- Watchdog -->
+              <RowDefinition Height="Auto"/> <!-- Service Control -->
+              <RowDefinition Height="Auto"/> <!-- Stack Actions -->
             </Grid.RowDefinitions>
 
             <!-- Watchdog -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
-              <Button x:Name="BtnStartWatchdog" Content="Start Watchdog" MinWidth="160"
-                      Background="#FF2D7A3A" Foreground="White" Margin="0,0,10,0"/>
-              <Button x:Name="BtnStopWatchdog" Content="Stop Watchdog" MinWidth="160"
-                      Background="#FF7A3A3A" Foreground="White"/>
+            <StackPanel Grid.Row="0" Margin="0,0,0,12">
+              <TextBlock Text="Watchdog"
+                         Foreground="#FF86B5E5"
+                         FontWeight="SemiBold"
+                         Margin="0,0,0,6"/>
+              <StackPanel Orientation="Horizontal">
+                <Button x:Name="BtnStartWatchdog"
+                        Content="Start Watchdog"
+                        MinWidth="160"
+                        Background="#FF2D7A3A"
+                        Foreground="White"
+                        Margin="0,0,10,0"/>
+                <Button x:Name="BtnStopWatchdog"
+                        Content="Stop Watchdog"
+                        MinWidth="160"
+                        Background="#FF7A3A3A"
+                        Foreground="White"/>
+              </StackPanel>
             </StackPanel>
 
-            <!-- Per-service -->
-            <StackPanel Grid.Row="1"
-                        Orientation="Horizontal"
-                        Margin="0,0,0,8">
-              <Button x:Name="BtnStartMySQL"
-                      Content="Start DB"
-                      Width="90"
-                      Margin="0,0,6,0"
-                      Style="{StaticResource BtnStart}"/>
+            <!-- Service Control -->
+            <StackPanel Grid.Row="1" Margin="0,0,0,12">
+              <TextBlock Text="Service Control"
+                         Foreground="#FF86B5E5"
+                         FontWeight="SemiBold"
+                         Margin="0,0,0,6"/>
 
-              <Button x:Name="BtnStopMySQL"
-                      Content="Stop DB"
-                      Width="90"
-                      Margin="0,0,12,0"
-                      Style="{StaticResource BtnStop}"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="160"/>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
 
-              <Button x:Name="BtnStartAuth"
-                      Content="Start Auth"
-                      Width="90"
-                      Margin="0,0,6,0"
-                      Style="{StaticResource BtnStart}"/>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/> <!-- header -->
+                  <RowDefinition Height="Auto"/> <!-- MySQL -->
+                  <RowDefinition Height="Auto"/> <!-- Auth -->
+                  <RowDefinition Height="Auto"/> <!-- World -->
+                </Grid.RowDefinitions>
 
-              <Button x:Name="BtnStopAuth"
-                      Content="Stop Auth"
-                      Width="90"
-                      Margin="0,0,12,0"
-                      Style="{StaticResource BtnStop}"/>
+                <!-- Column headers -->
+                <TextBlock Grid.Row="0" Grid.Column="1" Text="Start" Foreground="White" Opacity="0.8" Margin="0,0,10,6" HorizontalAlignment="Center"/>
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="Stop" Foreground="White" Opacity="0.8" Margin="0,0,10,6" HorizontalAlignment="Center"/>
+                <TextBlock Grid.Row="0" Grid.Column="3" Text="Restart" Foreground="White" Opacity="0.8" Margin="0,0,0,6" HorizontalAlignment="Center"/>
 
-              <Button x:Name="BtnStartWorld"
-                      Content="Start World"
-                      Width="100"
-                      Margin="0,0,6,0"
-                      Style="{StaticResource BtnStart}"/>
+                <!-- MySQL -->
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Database (MySQL)" Foreground="White" VerticalAlignment="Center" Margin="0,0,10,6"/>
+                <Button x:Name="BtnStartMySQL" Grid.Row="1" Grid.Column="1" Content="Start" Width="90" Margin="0,0,10,6" Style="{StaticResource BtnStart}"/>
+                <Button x:Name="BtnStopMySQL"  Grid.Row="1" Grid.Column="2" Content="Stop"  Width="90" Margin="0,0,10,6" Style="{StaticResource BtnStop}"/>
+                <Button x:Name="BtnRestartMySQL" Grid.Row="1" Grid.Column="3" Content="Restart" Width="90" Margin="0,0,0,6" Style="{StaticResource BtnSecondary}"/>
 
-              <Button x:Name="BtnStopWorld"
-                      Content="Stop World"
-                      Width="100"
-                      Style="{StaticResource BtnStop}"/>
+                <!-- Auth -->
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Auth Server" Foreground="White" VerticalAlignment="Center" Margin="0,0,10,6"/>
+                <Button x:Name="BtnStartAuth" Grid.Row="2" Grid.Column="1" Content="Start" Width="90" Margin="0,0,10,6" Style="{StaticResource BtnStart}"/>
+                <Button x:Name="BtnStopAuth"  Grid.Row="2" Grid.Column="2" Content="Stop"  Width="90" Margin="0,0,10,6" Style="{StaticResource BtnStop}"/>
+                <Button x:Name="BtnRestartAuth" Grid.Row="2" Grid.Column="3" Content="Restart" Width="90" Margin="0,0,0,6" Style="{StaticResource BtnSecondary}"/>
+
+                <!-- World -->
+                <TextBlock Grid.Row="3" Grid.Column="0" Text="World Server" Foreground="White" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <Button x:Name="BtnStartWorld" Grid.Row="3" Grid.Column="1" Content="Start" Width="90" Margin="0,0,10,0" Style="{StaticResource BtnStart}"/>
+                <Button x:Name="BtnStopWorld"  Grid.Row="3" Grid.Column="2" Content="Stop"  Width="90" Margin="0,0,10,0" Style="{StaticResource BtnStop}"/>
+                <Button x:Name="BtnRestartWorld" Grid.Row="3" Grid.Column="3" Content="Restart" Width="90" Margin="0,0,0,0" Style="{StaticResource BtnSecondary}"/>
+              </Grid>
             </StackPanel>
 
-            <!-- Start/Stop All -->
-            <StackPanel Grid.Row="2"
-                        Orientation="Horizontal">
-              <Button x:Name="BtnStartAll"
-                      Content="Start All (Ordered)"
-                      Width="180"
-                      Margin="0,0,10,0"
-                      Style="{StaticResource BtnStart}"/>
+            <!-- Stack Actions -->
+            <StackPanel Grid.Row="2">
+              <TextBlock Text="Stack Actions"
+                         Foreground="#FF86B5E5"
+                         FontWeight="SemiBold"
+                         Margin="0,0,0,6"/>
+              <StackPanel Orientation="Horizontal">
+                <Button x:Name="BtnStartAll"
+                        Content="Start Stack (Ordered)"
+                        Width="180"
+                        Margin="0,0,10,0"
+                        Style="{StaticResource BtnStart}"/>
 
-              <Button x:Name="BtnStopAll"
-                      Content="Stop All (Graceful)"
-                      Width="180"
-                      Style="{StaticResource BtnStop}"/>
+                <Button x:Name="BtnStopAll"
+                        Content="Stop Stack"
+                        Width="140"
+                        Margin="0,0,10,0"
+                        Style="{StaticResource BtnStop}"/>
+
+                <Button x:Name="BtnRestartStack"
+                        Content="Restart Stack"
+                        Width="140"
+                        Style="{StaticResource BtnSecondary}"/>
+              </StackPanel>
             </StackPanel>
-
           </Grid>
         </GroupBox>
 
@@ -1363,7 +1547,75 @@ $xaml = @"
 
       </Grid>
     </ScrollViewer>
-  </TabItem>
+
+    <GridSplitter Grid.Row="1"
+                  Height="6"
+                  HorizontalAlignment="Stretch"
+                  Background="#FF345A8A"
+                  ShowsPreview="True"/>
+
+    <!-- Live Log (Main tab only) -->
+    <GroupBox Grid.Row="2" Foreground="White" HorizontalAlignment="Stretch" Margin="0,8,0,0">
+  <GroupBox.Header>
+    <TextBlock Text="Live Log"
+               Foreground="#FFBDDCFF"
+               FontWeight="SemiBold"/>
+  </GroupBox.Header>
+
+  <GroupBox.Background>
+    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+      <GradientStop Color="#FF151B28" Offset="0.0" />
+      <GradientStop Color="#FF111623" Offset="1.0" />
+    </LinearGradientBrush>
+  </GroupBox.Background>
+
+  <Grid Margin="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+
+    <!-- Header row (text + button) -->
+    <Grid Grid.Row="0" Margin="0,0,0,6">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+
+      <TextBlock Grid.Column="0"
+                 Text="watchdog.log (updates every second)"
+                 Foreground="#FF86B5E5"/>
+
+      <Button x:Name="BtnClearLog"
+              Grid.Column="1"
+              Content="Clear Log"
+              MinWidth="100"
+              Margin="10,0,0,0"
+              Background="#FF1B2A42"
+              Foreground="White"
+              BorderBrush="#FF2B3E5E"/>
+    </Grid>
+
+    <!-- Log row -->
+    <ScrollViewer Grid.Row="1"
+                  VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Auto">
+      <TextBox x:Name="TxtLiveLog"
+               FontFamily="Consolas"
+               FontSize="12"
+               IsReadOnly="True"
+               TextWrapping="NoWrap"
+               Background="#FF0F141F"
+               Foreground="#FFE6F2FF"
+               BorderBrush="#FF345A8A"
+               VerticalScrollBarVisibility="Disabled"
+               HorizontalScrollBarVisibility="Disabled"/>
+    </ScrollViewer>
+
+  </Grid>
+</GroupBox>
+  </Grid>
+</TabItem>
 
   <!-- ================================================= -->
   <!-- TAB 2: Configuration                              -->
@@ -1376,6 +1628,7 @@ $xaml = @"
           <RowDefinition Height="Auto"/> <!-- Server Paths -->
           <RowDefinition Height="Auto"/> <!-- DB Settings -->
           <RowDefinition Height="Auto"/> <!-- NTFY -->
+          <RowDefinition Height="Auto"/> <!-- Worldserver Telnet -->
           <RowDefinition Height="Auto"/> <!-- Save Config -->
         </Grid.RowDefinitions>
 
@@ -1758,7 +2011,116 @@ $xaml = @"
         </GroupBox>
 
         <!-- Save Config (prominent, bottom) -->
-        <GroupBox Grid.Row="3" Foreground="White" HorizontalAlignment="Stretch" Margin="0,0,0,10">
+        
+        <!-- Worldserver Telnet -->
+        <GroupBox Grid.Row="3" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+          <GroupBox.Header>
+            <TextBlock Text="Worldserver Telnet"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0" />
+              <GradientStop Color="#FF111623" Offset="1.0" />
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="120"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="60"/>
+              <ColumnDefinition Width="110"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Host / Port -->
+            <TextBlock Grid.Row="0" Grid.Column="0"
+                       Text="Host/IP:"
+                       Foreground="White"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0"/>
+
+            <TextBox x:Name="TxtWorldTelnetHost"
+                     Grid.Row="0" Grid.Column="1"
+                     Margin="0,2,8,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
+
+            <TextBlock Grid.Row="0" Grid.Column="2"
+                       Text="Port:"
+                       Foreground="White"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0"/>
+
+            <TextBox x:Name="TxtWorldTelnetPort"
+                     Grid.Row="0" Grid.Column="3"
+                     Margin="0,2,0,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
+
+            <!-- Username -->
+            <TextBlock Grid.Row="1" Grid.Column="0"
+                       Text="Username:"
+                       Foreground="White"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0"/>
+
+            <TextBox x:Name="TxtWorldTelnetUser"
+                     Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3"
+                     Margin="0,2,0,2"
+                     Background="#FF0F141F"
+                     Foreground="White"
+                     BorderBrush="#FF345A8A"/>
+
+            <!-- Password -->
+            <TextBlock Grid.Row="2" Grid.Column="0"
+                       Text="Password:"
+                       Foreground="White"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0"/>
+
+            <PasswordBox x:Name="TxtWorldTelnetPassword"
+                         Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="3"
+                         Margin="0,2,0,2"
+                         Background="#FF0F141F"
+                         Foreground="White"
+                         BorderBrush="#FF345A8A"/>
+
+            <!-- Stored status -->
+            <TextBlock Grid.Row="3" Grid.Column="0"
+                       Text="Stored:"
+                       Foreground="#FF86B5E5"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0"/>
+
+            <TextBlock x:Name="LblWorldTelnetPasswordStatus"
+                       Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="3"
+                       Text="Password not set"
+                       Foreground="#FFFFD24D"
+                       VerticalAlignment="Center"/>
+
+            <!-- Hint -->
+            <TextBlock Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="4"
+                       Text="Note: Password is stored encrypted in ProgramData and is not shown after restart. To change it, enter a new password and click Save Configuration."
+                       Foreground="#FF86B5E5"
+                       TextWrapping="Wrap"
+                       Margin="0,6,0,0"/>
+          </Grid>
+        </GroupBox>
+
+<GroupBox Grid.Row="4" Foreground="White" HorizontalAlignment="Stretch" Margin="0,0,0,10">
           <GroupBox.Header>
             <TextBlock Text="Save"
                        Foreground="#FFBDDCFF"
@@ -2020,6 +2382,7 @@ $xaml = @"
       </Grid>
     </GroupBox>
 
+
     <!-- Repack Backup -->
     <GroupBox Grid.Row="2" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
       <GroupBox.Header>
@@ -2072,15 +2435,19 @@ $xaml = @"
         <TextBox x:Name="TxtRepackBackupDest"
                  Grid.Row="1" Grid.Column="1"
                  Margin="8,2,8,6"
-                 MinWidth="320"
-                 IsReadOnly="True"/>
+                 MinWidth="320"/>
 
-        <Button x:Name="BtnOpenRepackBackupDest"
-                Grid.Row="1" Grid.Column="2"
-                Margin="0,2,0,6"
-                Content="Open"
-                MinHeight="28"
-                Style="{StaticResource BtnSecondary}"/>
+        <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,2,0,6">
+          <Button x:Name="BtnBrowseRepackBackupDest"
+                  Content="Browse"
+                  MinHeight="28"
+                  Margin="0,0,0,6"
+                  Style="{StaticResource BtnSecondary}"/>
+          <Button x:Name="BtnOpenRepackBackupDest"
+                  Content="Open"
+                  MinHeight="28"
+                  Style="{StaticResource BtnSecondary}"/>
+        </StackPanel>
 
         <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3"
                     Orientation="Horizontal"
@@ -2126,7 +2493,246 @@ $xaml = @"
   </Grid>
 </TabItem>
 
-  <!-- ================================================= -->
+  
+<!-- ================================================= -->
+<!-- TAB 4: Worldserver Console                         -->
+<!-- ================================================= -->
+<TabItem Header="Worldserver Console">
+  <Grid Margin="12">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+
+    <!-- Connection -->
+    <GroupBox Grid.Row="0" Margin="0,0,0,10" Foreground="White" HorizontalAlignment="Stretch">
+      <GroupBox.Header>
+        <TextBlock Text="Telnet Connection" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+      </GroupBox.Header>
+
+      <GroupBox.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#FF151B28" Offset="0.0"/>
+          <GradientStop Color="#FF111623" Offset="1.0"/>
+        </LinearGradientBrush>
+      </GroupBox.Background>
+
+      <Grid Margin="10">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <Button x:Name="BtnTelnetConnect"
+                Grid.Column="0"
+                Content="Connect"
+                MinWidth="110"
+                Height="32"
+                Margin="0,0,8,0"
+                Style="{StaticResource BtnPrimary}"/>
+
+        <Button x:Name="BtnTelnetDisconnect"
+                Grid.Column="1"
+                Content="Disconnect"
+                MinWidth="110"
+                Height="32"
+                Margin="0,0,14,0"
+                Style="{StaticResource BtnSecondary}"/>
+
+        <TextBlock Grid.Column="2"
+                   Text="Target:"
+                   Foreground="#FF86B5E5"
+                   VerticalAlignment="Center"
+                   Margin="0,0,6,0"/>
+
+        <TextBlock x:Name="TxtTelnetTarget"
+                   Grid.Column="3"
+                   Text="—"
+                   Foreground="White"
+                   VerticalAlignment="Center"/>
+
+        <TextBlock x:Name="LblTelnetStatus"
+                   Grid.Column="4"
+                   Text="Disconnected"
+                   Foreground="#FFFFD24D"
+                   VerticalAlignment="Center"/>
+
+      </Grid>
+    </GroupBox>
+
+    <!-- Output + Worldserver Log -->
+    <Grid Grid.Row="1" Margin="0,0,0,10">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="6"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+
+      <GroupBox Grid.Row="0" Margin="0" Foreground="White" HorizontalAlignment="Stretch">
+      <GroupBox.Header>
+        <TextBlock Text="Console Output" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+      </GroupBox.Header>
+
+      <GroupBox.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#FF151B28" Offset="0.0"/>
+          <GradientStop Color="#FF111623" Offset="1.0"/>
+        </LinearGradientBrush>
+      </GroupBox.Background>
+
+      <Grid Margin="10">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <TextBox x:Name="TxtTelnetOutput"
+                 Grid.Row="0"
+                 VerticalAlignment="Stretch"
+                 MinHeight="220"
+                 FontFamily="Consolas"
+                 FontSize="13"
+                 Background="#FF0F141F"
+                 Foreground="White"
+                 BorderBrush="#FF345A8A"
+                 IsReadOnly="True"
+                 AcceptsReturn="True"
+                 TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto"
+                 HorizontalScrollBarVisibility="Auto"/>
+      </Grid>
+    </GroupBox>
+    <!-- Command -->
+    <GroupBox Grid.Row="1" Margin="0,10,0,10" Foreground="White" HorizontalAlignment="Stretch">
+      <GroupBox.Header>
+        <TextBlock Text="Command" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+      </GroupBox.Header>
+
+      <GroupBox.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#FF151B28" Offset="0.0"/>
+          <GradientStop Color="#FF111623" Offset="1.0"/>
+        </LinearGradientBrush>
+      </GroupBox.Background>
+
+      <Grid Margin="10">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <TextBox x:Name="TxtTelnetCommand"
+                 Grid.Column="0"
+                 FontFamily="Consolas"
+                 Background="#FF0F141F"
+                 Foreground="White"
+                 BorderBrush="#FF345A8A"
+                 Margin="0,0,10,0"
+                 MinHeight="28"/>
+
+        <Button x:Name="BtnTelnetSend"
+                Grid.Column="1"
+                Content="Send"
+                MinWidth="110"
+                Height="30"
+                Style="{StaticResource BtnPrimary}"/>
+      </Grid>
+    </GroupBox>
+
+  
+
+
+
+      <GridSplitter Grid.Row="2"
+                    Height="6"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Stretch"
+                    Background="#FF345A8A"
+                    ShowsPreview="True"/>
+
+      <GroupBox Grid.Row="3" Margin="0" Foreground="White" HorizontalAlignment="Stretch">
+  <GroupBox.Header>
+    <TextBlock Text="Worldserver Log Output" Foreground="#FFBDDCFF" FontWeight="SemiBold"/>
+  </GroupBox.Header>
+
+  <GroupBox.Background>
+    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+      <GradientStop Color="#FF151B28" Offset="0.0"/>
+      <GradientStop Color="#FF111623" Offset="1.0"/>
+    </LinearGradientBrush>
+  </GroupBox.Background>
+
+  <Grid Margin="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+
+    <Grid Grid.Row="0" Margin="0,0,0,8" Panel.ZIndex="10">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+
+      <CheckBox x:Name="ChkWorldLogTail"
+                Grid.Column="0"
+                Content="Tail log"
+                Foreground="White"
+                Margin="0,0,10,0"
+                VerticalAlignment="Center"/>
+
+      <TextBox x:Name="TxtWorldLogPath"
+               Grid.Column="1"
+               IsReadOnly="True"
+               Background="#FF0F141F"
+               Foreground="White"
+               BorderBrush="#FF345A8A"
+               Margin="0,0,10,0"
+               MinHeight="26"/>
+
+      <Button x:Name="BtnBrowseWorldLog"
+              Grid.Column="2"
+              Content="Browse…"
+              Width="90"
+              MinHeight="28"
+              Margin="0,0,10,0"
+              Style="{StaticResource BtnSecondary}"
+              Panel.ZIndex="20"
+              IsEnabled="True"
+              IsHitTestVisible="True"/>
+
+      <Button x:Name="BtnClearWorldLog"
+              Grid.Column="3"
+              Content="Clear"
+              Style="{StaticResource BtnSecondary}"/>
+    </Grid>
+
+    <TextBox x:Name="TxtWorldLogOutput"
+             Grid.Row="1"
+             VerticalAlignment="Stretch"
+             MinHeight="180"
+             FontFamily="Consolas"
+             FontSize="13"
+             Background="#FF0F141F"
+             Foreground="White"
+             BorderBrush="#FF345A8A"
+             IsReadOnly="True"
+             AcceptsReturn="True"
+             TextWrapping="NoWrap"
+             VerticalScrollBarVisibility="Auto"
+             HorizontalScrollBarVisibility="Auto"/>
+  </Grid>
+</GroupBox>
+    </Grid>
+</Grid>
+</TabItem>
+
+<!-- ================================================= -->
   <!-- TAB 4: Updates                                   -->
   <!-- ================================================= -->
   <TabItem Header="Updates">
@@ -2135,6 +2741,7 @@ $xaml = @"
 
       <Grid Margin="12">
         <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="*"/>
@@ -2235,8 +2842,72 @@ $xaml = @"
           </Grid>
         </GroupBox>
 
+
+        <!-- SPP V2 Legion Repack Update -->
+        <GroupBox Grid.Row="2"
+                  Margin="0,0,0,10"
+                  Foreground="White"
+                  HorizontalAlignment="Stretch">
+
+          <GroupBox.Header>
+            <TextBlock Text="SPP V2 Legion Repack Update"
+                       Foreground="#FFBDDCFF"
+                       FontWeight="SemiBold"/>
+          </GroupBox.Header>
+
+          <GroupBox.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#FF151B28" Offset="0.0"/>
+              <GradientStop Color="#FF111623" Offset="1.0"/>
+            </LinearGradientBrush>
+          </GroupBox.Background>
+
+          <Grid Margin="10">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0"
+                       TextWrapping="Wrap"
+                       Foreground="#FF86B5E5">
+Stops World/Auth/MySQL, creates a full repack backup, runs the SPP V2 updater (wget + 7za + Website\Update.bat), then restarts services (MySQL -> Auth -> World).
+            </TextBlock>
+
+            <StackPanel Grid.Row="1"
+                        Orientation="Horizontal"
+                        Margin="0,10,0,0">
+              <Button x:Name="BtnSppV2RepackUpdate"
+                      Content="Run SPP V2 Repack Update"
+                      MinWidth="230"
+                      Style="{StaticResource BtnPrimary}"/>
+
+              <TextBlock x:Name="TxtSppV2UpdateTarget"
+                         Text="Target: (set Repack folder on Tools tab)"
+                         Margin="12,3,0,0"
+                         Foreground="#FF86B5E5"
+                         VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <StackPanel Grid.Row="2" Margin="0,10,0,0">
+              <TextBlock x:Name="TxtSppV2UpdateStatus"
+                         Text=""
+                         Foreground="#FF86B5E5"
+                         Visibility="Collapsed"
+                         TextWrapping="Wrap"/>
+              <ProgressBar x:Name="PbSppV2Update"
+                           Height="16"
+                           Minimum="0"
+                           Maximum="100"
+                           Value="0"
+                           Visibility="Collapsed"/>
+            </StackPanel>
+
+          </Grid>
+        </GroupBox>
         <!-- Notes -->
-        <TextBlock Grid.Row="2"
+        <TextBlock Grid.Row="3"
                    TextWrapping="Wrap"
                    Foreground="#FF86B5E5">
 This application checks GitHub releases to determine if a newer version is available.
@@ -2248,69 +2919,7 @@ Updates are applied in-place and may restart services if required.
   </TabItem>
 
 </TabControl>
-
-        <!-- Live Log (independent scroll) -->
-<GroupBox Grid.Row="1" Foreground="White" HorizontalAlignment="Stretch" Margin="0,8,0,0">
-  <GroupBox.Header>
-    <TextBlock Text="Live Log"
-               Foreground="#FFBDDCFF"
-               FontWeight="SemiBold"/>
-  </GroupBox.Header>
-
-  <GroupBox.Background>
-    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#FF151B28" Offset="0.0" />
-      <GradientStop Color="#FF111623" Offset="1.0" />
-    </LinearGradientBrush>
-  </GroupBox.Background>
-
-  <Grid Margin="10">
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="*"/>
-    </Grid.RowDefinitions>
-
-    <!-- Header row (text + button) -->
-    <Grid Grid.Row="0" Margin="0,0,0,6">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="*"/>
-        <ColumnDefinition Width="Auto"/>
-      </Grid.ColumnDefinitions>
-
-      <TextBlock Grid.Column="0"
-                 Text="watchdog.log (updates every second)"
-                 Foreground="#FF86B5E5"/>
-
-      <Button x:Name="BtnClearLog"
-              Grid.Column="1"
-              Content="Clear Log"
-              MinWidth="100"
-              Margin="10,0,0,0"
-              Background="#FF1B2A42"
-              Foreground="White"
-              BorderBrush="#FF2B3E5E"/>
-    </Grid>
-
-    <!-- Log row -->
-    <ScrollViewer Grid.Row="1"
-                  VerticalScrollBarVisibility="Auto"
-                  HorizontalScrollBarVisibility="Auto">
-      <TextBox x:Name="TxtLiveLog"
-               FontFamily="Consolas"
-               FontSize="12"
-               IsReadOnly="True"
-               TextWrapping="NoWrap"
-               Background="#FF0F141F"
-               Foreground="#FFE6F2FF"
-               BorderBrush="#FF345A8A"
-               VerticalScrollBarVisibility="Disabled"
-               HorizontalScrollBarVisibility="Disabled"/>
-    </ScrollViewer>
-
-  </Grid>
-</GroupBox>
-
-      </Grid>
+</Grid>
     </Grid>
   </Border>
 </Window>
@@ -2450,8 +3059,14 @@ $BtnStartAuth   = $Window.FindName("BtnStartAuth")
 $BtnStopAuth    = $Window.FindName("BtnStopAuth")
 $BtnStartWorld  = $Window.FindName("BtnStartWorld")
 $BtnStopWorld   = $Window.FindName("BtnStopWorld")
+$BtnRestartMySQL = $Window.FindName("BtnRestartMySQL")
+$BtnRestartAuth  = $Window.FindName("BtnRestartAuth")
+$BtnRestartWorld = $Window.FindName("BtnRestartWorld")
+
 $BtnStartAll    = $Window.FindName("BtnStartAll")
 $BtnStopAll     = $Window.FindName("BtnStopAll")
+$BtnRestartStack = $Window.FindName("BtnRestartStack")
+
 $BtnClearLog    = $Window.FindName("BtnClearLog")
 
 # Server Info: DB controls
@@ -2478,6 +3093,7 @@ $TxtDbRestoreDatabases   = Assert-Control $Window "TxtDbRestoreDatabases"
 $TxtRepackRoot           = Assert-Control $Window "TxtRepackRoot"
 $BtnBrowseRepackRoot     = Assert-Control $Window "BtnBrowseRepackRoot"
 $TxtRepackBackupDest     = Assert-Control $Window "TxtRepackBackupDest"
+$BtnBrowseRepackBackupDest = Assert-Control $Window "BtnBrowseRepackBackupDest"
 $BtnOpenRepackBackupDest = Assert-Control $Window "BtnOpenRepackBackupDest"
 $BtnRunFullBackup        = Assert-Control $Window "BtnRunFullBackup"
 $BtnRunConfigBackup      = Assert-Control $Window "BtnRunConfigBackup"
@@ -2499,6 +3115,71 @@ $TxtUtilWorldCpu  = Assert-Control $Window "TxtUtilWorldCpu"
 $TxtUtilWorldMem  = Assert-Control $Window "TxtUtilWorldMem"
 $TxtWorldUptime   = Assert-Control $Window "TxtWorldUptime"
 
+
+# Configuration: Worldserver Telnet
+$TxtWorldTelnetHost          = Assert-Control $Window "TxtWorldTelnetHost"
+$TxtWorldTelnetPort          = Assert-Control $Window "TxtWorldTelnetPort"
+$TxtWorldTelnetUser          = Assert-Control $Window "TxtWorldTelnetUser"
+$TxtWorldTelnetPassword      = Assert-Control $Window "TxtWorldTelnetPassword"
+$LblWorldTelnetPasswordStatus= Assert-Control $Window "LblWorldTelnetPasswordStatus"
+
+# Tab: Worldserver Console
+$BtnTelnetConnect    = Assert-Control $Window "BtnTelnetConnect"
+$BtnTelnetDisconnect = Assert-Control $Window "BtnTelnetDisconnect"
+$TxtTelnetTarget     = Assert-Control $Window "TxtTelnetTarget"
+$LblTelnetStatus     = Assert-Control $Window "LblTelnetStatus"
+$TxtTelnetOutput     = Assert-Control $Window "TxtTelnetOutput"
+$TxtTelnetCommand    = Assert-Control $Window "TxtTelnetCommand"
+$BtnTelnetSend       = Assert-Control $Window "BtnTelnetSend"
+
+# Worldserver Log Tail (Console Tab)
+$ChkWorldLogTail     = Assert-Control $Window "ChkWorldLogTail"
+$TxtWorldLogPath     = Assert-Control $Window "TxtWorldLogPath"
+$BtnBrowseWorldLog   = Assert-Control $Window "BtnBrowseWorldLog"
+$BtnClearWorldLog    = Assert-Control $Window "BtnClearWorldLog"
+$TxtWorldLogOutput   = Assert-Control $Window "TxtWorldLogOutput"
+# -------------------------------------------------
+# Worldserver log Browse binding (early + multi-event)
+# -------------------------------------------------
+if (-not $script:WorldLogBrowseLastTick) { $script:WorldLogBrowseLastTick = 0 }
+
+function Invoke-WorldLogBrowseOnce {
+    try {
+        $now = [Environment]::TickCount
+        $delta = $now - $script:WorldLogBrowseLastTick
+        if ($delta -lt 400 -and $delta -gt -400) { return }
+        $script:WorldLogBrowseLastTick = $now
+    } catch { }
+
+    try {
+        Browse-WorldLogPath
+    } catch {
+        $em = $_.Exception.Message
+        try { Add-GuiLog ("ERROR: World log browse failed: {0}" -f $em) } catch { }
+        try { Append-WorldLogOutput ("[World log] ERROR: Browse failed: {0}`r`n" -f $em) } catch { }
+    }
+}
+
+# Primary: normal Click event
+try { $BtnBrowseWorldLog.Add_Click({ Invoke-WorldLogBrowseOnce }) } catch { }
+
+# Fallbacks: preview mouse up on button and on the path box (some WPF templates swallow Click)
+try {
+    $BtnBrowseWorldLog.add_PreviewMouseLeftButtonUp({
+        param($s,$e)
+        try { Invoke-WorldLogBrowseOnce } catch { }
+        try { $e.Handled = $true } catch { }
+    })
+} catch { }
+
+try {
+    $TxtWorldLogPath.add_PreviewMouseLeftButtonUp({
+        param($s,$e)
+        try { Invoke-WorldLogBrowseOnce } catch { }
+        try { $e.Handled = $true } catch { }
+    })
+} catch { }
+
 # Tab: Update
 $TxtCurrentVersion = $Window.FindName("TxtCurrentVersion")
 $TxtLatestVersion  = $Window.FindName("TxtLatestVersion")
@@ -2506,6 +3187,13 @@ $BtnCheckUpdates   = $Window.FindName("BtnCheckUpdates")
 $BtnUpdateNow      = $Window.FindName("BtnUpdateNow")
 $TxtUpdateFlowStatus = $Window.FindName("TxtUpdateFlowStatus")
 $PbUpdateFlow        = $Window.FindName("PbUpdateFlow")
+
+
+$BtnSppV2RepackUpdate = $Window.FindName("BtnSppV2RepackUpdate")
+$TxtSppV2UpdateTarget = $Window.FindName("TxtSppV2UpdateTarget")
+$TxtSppV2UpdateStatus = $Window.FindName("TxtSppV2UpdateStatus")
+$PbSppV2Update        = $Window.FindName("PbSppV2Update")
+
 
 $BtnLaunchSppManager = $Window.FindName("BtnLaunchSppManager")
 
@@ -2529,8 +3217,10 @@ try {
                 $ex = $e.Exception
                 $msg = if ($ex) { $ex.ToString() } else { "Unknown Dispatcher exception (no Exception object)." }
 
+                # Your log function
                 Add-GuiLog "UNHANDLED UI EXCEPTION: $msg"
 
+                # Optional: show a minimal user prompt (comment out if you prefer silent logging)
                 try {
                     [System.Windows.MessageBox]::Show(
                         "An unexpected UI error occurred. Details were written to the log.",
@@ -2610,13 +3300,33 @@ function Get-CommonParentPath {
     return $root
 }
 
-# Fixed backup destination
-$script:RepackBackupDir = Join-Path $DataDir "backups"
+# Backup destinations (default: ProgramData\WoWWatchdog\backups; user-selectable and persisted)
+$script:DefaultBackupDir = Join-Path $DataDir "backups"
+
+# Repack backup destination: Config.RepackBackupFolder > default
+$script:RepackBackupDir = $script:DefaultBackupDir
+try {
+    $rb = [string]$Config.RepackBackupFolder
+    if (-not [string]::IsNullOrWhiteSpace($rb)) { $script:RepackBackupDir = $rb }
+} catch { }
+
 if (-not (Test-Path -LiteralPath $script:RepackBackupDir)) {
     New-Item -ItemType Directory -Path $script:RepackBackupDir -Force | Out-Null
 }
 try { $TxtRepackBackupDest.Text = $script:RepackBackupDir } catch { }
 
+# DB backup destination: Config.DbBackupFolder > default
+try {
+    $dbb = [string]$Config.DbBackupFolder
+    if ([string]::IsNullOrWhiteSpace($dbb)) { $dbb = $script:DefaultBackupDir }
+    if ([string]::IsNullOrWhiteSpace(($TxtDbBackupFolder.Text + "").Trim())) {
+        $TxtDbBackupFolder.Text = $dbb
+    }
+} catch {
+    if ([string]::IsNullOrWhiteSpace(($TxtDbBackupFolder.Text + "").Trim())) {
+        $TxtDbBackupFolder.Text = $script:DefaultBackupDir
+    }
+}
 # Default repack root: Config.RepackRoot, else infer from configured paths
 try {
     if ([string]::IsNullOrWhiteSpace(($TxtRepackRoot.Text + ""))) {
@@ -2716,7 +3426,7 @@ function Get-DbConfig {
     $user = [string]$Config.DbUser
     if ([string]::IsNullOrWhiteSpace($user)) { $user = "root" }
 
-    # mysql.exe comes from Config.MySQLExe
+    # mysql.exe comes from Config.MySQLExe (already used by player count)
     $mysqlExe = [string]$Config.MySQLExe
     if ([string]::IsNullOrWhiteSpace($mysqlExe)) { $mysqlExe = $DefaultMySqlExe }
 
@@ -2749,10 +3459,12 @@ function Get-DbConfig {
 
 $BtnBattleShopEditor.Add_Click({
     try {
+        # Match your existing "tools install base" approach
+        # Example only; replace with your current base tools path variable/pattern:
         $toolRoot = $script:ToolsDir
 
         $exe = Ensure-UrlZipToolInstalled `
-            -ZipUrl "https://cdn.discordapp.com/attachments/576868080165322752/1399580989738586263/BattleShopEditor-v1008.zip?ex=695e6f1e&is=695d1d9e&hm=1830278fb73b2f96e372f8ef22814e275b11e0580cb288e4c3c7a370a3661e1a&" `
+            -ZipUrl "https://cdn.discordapp.com/attachments/576868080165322752/1399580989738586263/BattleShopEditor-v1008.zip?ex=6961121e&is=695fc09e&hm=09ad969d9045ae0db36e6afbe4bb62b11e70efb09fc5fba5e04ddd0a49dd007b&" `
             -InstallDir $toolRoot `
             -ExeRelativePath "BattleShopEditor\BattleShopEditor.exe" `
             -ToolName "BattleShopEditor" `
@@ -2770,6 +3482,33 @@ $BtnBattleShopEditor.Add_Click({
     }
 })
 
+
+function Persist-ConfigFile {
+    try {
+        $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $ConfigPath -Encoding UTF8
+    } catch {
+        try { Add-GuiLog "WARN: Failed to persist config: $($_.Exception.Message)" } catch { }
+    }
+}
+
+function Persist-BackupFolderSettings {
+    try {
+        $db = ($TxtDbBackupFolder.Text + "").Trim()
+        $rp = ($TxtRepackBackupDest.Text + "").Trim()
+
+        if ([string]::IsNullOrWhiteSpace($db)) { $db = $script:DefaultBackupDir }
+        if ([string]::IsNullOrWhiteSpace($rp)) { $rp = $script:DefaultBackupDir }
+
+        $Config.DbBackupFolder = $db
+        $Config.RepackBackupFolder = $rp
+
+        Persist-ConfigFile
+    } catch {
+        try { Add-GuiLog "WARN: Failed to persist backup folder settings: $($_.Exception.Message)" } catch { }
+    }
+}
+
+
 # -------- Browse: Backup folder --------
 $BtnBrowseDbBackupFolder.Add_Click({
     try {
@@ -2780,6 +3519,7 @@ $BtnBrowseDbBackupFolder.Add_Click({
 
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $TxtDbBackupFolder.Text = $dlg.SelectedPath
+            Persist-BackupFolderSettings
         }
     } catch {
         Add-GuiLog "Backup folder browse failed: $($_.Exception.Message)"
@@ -2789,6 +3529,46 @@ $BtnBrowseDbBackupFolder.Add_Click({
 
 
 # -------- Browse: Repack root folder --------
+
+# Persist backup folder changes even if the user does not click "Save Configuration"
+try {
+    $TxtDbBackupFolder.Add_LostFocus({
+        try { Persist-BackupFolderSettings } catch { }
+    })
+} catch { }
+
+# -------- Browse: Repack backup destination --------
+$BtnBrowseRepackBackupDest.Add_Click({
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue | Out-Null
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select a folder for Repack backups"
+
+        $cur = ($TxtRepackBackupDest.Text + "").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($cur) -and (Test-Path -LiteralPath $cur)) {
+            $dlg.SelectedPath = $cur
+        }
+
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $TxtRepackBackupDest.Text = $dlg.SelectedPath
+            $script:RepackBackupDir = $dlg.SelectedPath
+            Persist-BackupFolderSettings
+        }
+    } catch {
+        Add-GuiLog "Repack backup destination browse failed: $($_.Exception.Message)"
+    }
+})
+
+try {
+    $TxtRepackBackupDest.Add_LostFocus({
+        try {
+            $script:RepackBackupDir = ($TxtRepackBackupDest.Text + "").Trim()
+            Persist-BackupFolderSettings
+        } catch { }
+    })
+} catch { }
+
+
 $BtnBrowseRepackRoot.Add_Click({
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue | Out-Null
@@ -2833,7 +3613,7 @@ $BtnBrowseDbRestoreFile.Add_Click({
 })
 
 # -------------------------------------------------
-# DB Backup UI state helper
+# DB Backup UI state helper (must be in global scope)
 # -------------------------------------------------
 function Set-DbBackupUiState {
     param(
@@ -2890,6 +3670,7 @@ function Restore-DatabaseMulti {
 
     $allowed = @("legion_auth","legion_characters","legion_hotfixes","legion_world")
 
+    # MySQL identifier quoting uses backticks. In PowerShell, build them safely:
     $bt = [char]96
     function Quote-MySqlIdent([string]$name) { return ($bt + $name + $bt) }
 
@@ -3042,7 +3823,7 @@ function Restore-DatabaseMulti {
             $proc.StartInfo = $psi
             if (-not $proc.Start()) { throw "Failed to start mysql.exe for restore." }
 
-            # Stream the SQL file to mysql stdin
+            # Stream the SQL file to mysql stdin (no giant in-memory string)
             $src = [System.IO.File]::Open($sqlPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
             try {
                 $dst = $proc.StandardInput.BaseStream
@@ -3083,7 +3864,7 @@ function Restore-DatabaseMulti {
 }
 
 # -------------------------------------------------
-# DB Restore UI state helper
+# DB Restore UI state helper (global scope)
 # -------------------------------------------------
 
 function Set-DbRestoreUiState {
@@ -3114,6 +3895,7 @@ function Set-DbRestoreUiState {
         $TxtDbRestoreFile.IsEnabled       = -not $IsBusy
         $ChkDbRestoreConfirm.IsEnabled    = -not $IsBusy
 
+        # Optional: lock backup during restore
         $BtnRunDbBackup.IsEnabled           = -not $IsBusy
         $BtnBrowseDbBackupFolder.IsEnabled  = -not $IsBusy
         $TxtDbBackupFolder.IsEnabled        = -not $IsBusy
@@ -3153,14 +3935,16 @@ function Set-RepackBackupUiState {
         $BtnRunFullBackup.IsEnabled    = -not $IsBusy
         $BtnRunConfigBackup.IsEnabled  = -not $IsBusy
         $BtnBrowseRepackRoot.IsEnabled = -not $IsBusy
+        $BtnBrowseRepackBackupDest.IsEnabled = -not $IsBusy
         $BtnOpenRepackBackupDest.IsEnabled = -not $IsBusy
         $TxtRepackRoot.IsEnabled       = -not $IsBusy
+        $TxtRepackBackupDest.IsEnabled = -not $IsBusy
     } catch { }
 }
 
 
 
-# -------- Run Backup async runspace + UI progress; AsyncCallback) --------
+# -------- Run Backup (PS 5.1 safe async runspace + UI progress; AsyncCallback) --------
 $BtnRunDbBackup.Add_Click({
     try {
         Set-DbBackupUiState -IsBusy $true -StatusText "Starting backup… please wait."
@@ -3423,7 +4207,7 @@ $script:DbBackupTimer.Add_Tick({
         $job = $script:DbBackupJob
         if (-not $job) { return }
 
-        # IMPORTANT: Use the wait handle, not IsCompleted
+        # IMPORTANT: Use the wait handle, not IsCompleted (more reliable in PS 5.1)
         if (-not $job.Async.AsyncWaitHandle.WaitOne(0)) { return }
 
         # Stop timer immediately to prevent re-entrancy
@@ -3450,7 +4234,7 @@ $script:DbBackupTimer.Add_Tick({
             return
         }
 
-        # Process results on UI thread
+        # Process results on UI thread (we are already on UI thread via DispatcherTimer)
         try {
             if ($result -and $result.Ok) {
                 foreach ($line in ($result.Skipped | Where-Object { $_ })) {
@@ -3506,7 +4290,7 @@ $script:DbBackupTimer.Start()
     }
 })
 
-# -------- Run Restore (async runspace + UI progress) --------
+# -------- Run Restore (PS 5.1 safe async runspace + UI progress) --------
 $BtnRunDbRestore.Add_Click({
     try {
         # Lock UI + show progress immediately
@@ -3553,6 +4337,7 @@ $BtnRunDbRestore.Add_Click({
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.Runspace = $rs
 
+        # IMPORTANT: the runspace does NOT automatically know your functions
         $fnRestore = ${function:Restore-DatabaseMulti}.Ast.Extent.Text
         $null = $ps.AddScript($fnRestore)
 
@@ -3571,7 +4356,7 @@ $BtnRunDbRestore.Add_Click({
                     -Force:($state.Force) `
                     -ExtraArgs $state.ExtraArgs
 
-                # If Restore-DatabaseMulti returns only $true, DbList will be null
+                # If Restore-DatabaseMulti returns only $true, DbList will be null (that's OK)
                 $dbList = $null
                 if ($r -is [pscustomobject] -and $r.PSObject.Properties.Match("DbList").Count -gt 0) {
                     $dbList = @($r.DbList | ForEach-Object { "$_" })
@@ -4179,6 +4964,7 @@ $BtnRunConfigBackup.Add_Click({
 
 # =================================================
 # Broad Helpers (UI, Identity, Roles, NTFY)
+# Paste after controls are assigned.
 # =================================================
 
 function Invoke-Ui {
@@ -4306,6 +5092,26 @@ function Get-NtfyPriorityForService {
     return $prio
 }
 
+function Normalize-NtfyTag {
+    param([string]$Tag)
+
+    if ([string]::IsNullOrWhiteSpace($Tag)) { return $null }
+
+    $t = $Tag.Trim().ToLowerInvariant()
+
+    # Replace whitespace with hyphens and remove characters that commonly break header parsing
+    $t = [regex]::Replace($t, '\s+', '-')
+    $t = [regex]::Replace($t, '[^a-z0-9_-]', '')
+
+    # Collapse repeated separators
+    $t = [regex]::Replace($t, '-{2,}', '-')
+    $t = [regex]::Replace($t, '_{2,}', '_')
+
+    $t = $t.Trim('-', '_')
+    if ($t.Length -eq 0) { return $null }
+    return $t
+}
+
 function Get-NtfyTags {
     param(
         [Parameter(Mandatory)][string]$ServiceName,
@@ -4314,19 +5120,24 @@ function Get-NtfyTags {
 
     $tags = New-Object System.Collections.Generic.List[string]
 
+    # User-specified tags (comma-separated)
     $raw = (Get-TextSafe -Control $TxtNtfyTags).Trim()
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
         foreach ($t in ($raw -split ",")) {
-            $tt = $t.Trim()
+            $tt = Normalize-NtfyTag ($t.Trim())
             if ($tt) { [void]$tags.Add($tt) }
         }
     }
 
-    $exp = (Get-ExpansionLabel).ToLowerInvariant()
-    [void]$tags.Add("wow")
-    [void]$tags.Add($exp)
-    [void]$tags.Add($ServiceName.ToLowerInvariant())
-    [void]$tags.Add($StateTag.ToLowerInvariant())
+    # Auto-tags (normalized to avoid proxy/server header parsing issues)
+    $exp = Normalize-NtfyTag (Get-ExpansionLabel)
+    $svc = Normalize-NtfyTag $ServiceName
+    $st  = Normalize-NtfyTag $StateTag
+
+    foreach ($x in @("wow", $exp, $svc, $st)) {
+        $nx = Normalize-NtfyTag $x
+        if ($nx) { [void]$tags.Add($nx) }
+    }
 
     (($tags | Where-Object { $_ } | Select-Object -Unique) -join ",")
 }
@@ -4343,10 +5154,12 @@ function Send-NtfyMessage {
     if (-not $url) { return $false }
 
     $headers = @{
-        "Title"    = $Title
-        "Priority" = "$Priority"
-        "Tags"     = $TagsCsv
-    }
+    "Title"    = (([string]$Title) -replace "[\r\n]+", " ").Trim()
+    "Priority" = "$Priority"
+}
+if (-not [string]::IsNullOrWhiteSpace($TagsCsv)) {
+    $headers["Tags"] = (([string]$TagsCsv) -replace "[\r\n]+", "").Trim()
+}
 
     $mode     = (Get-SelectedComboContent $CmbNtfyAuthMode).Trim()
     $username = (Get-TextSafe -Control $TxtNtfyUsername)
@@ -4383,8 +5196,52 @@ function Send-NtfyMessage {
 
     foreach ($k in $authHeaders.Keys) { $headers[$k] = $authHeaders[$k] }
 
-    Invoke-RestMethod -Uri $url -Method Post -Body $Body -Headers $headers -ErrorAction Stop | Out-Null
-    return $true
+    # Send with simple retry for transient failures (timeouts, 429, 5xx)
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Invoke-RestMethod -Uri $url -Method Post -Body $Body -Headers $headers -ContentType "text/plain; charset=utf-8" -ErrorAction Stop | Out-Null
+            return $true
+        }
+        catch {
+            $ex = $_.Exception
+            $status = $null
+            $respText = $null
+
+            try {
+                if ($ex -and $ex.Response) {
+                    # HttpWebResponse
+                    $status = [int]$ex.Response.StatusCode
+                    try {
+                        $stream = $ex.Response.GetResponseStream()
+                        if ($stream) {
+                            $reader = New-Object System.IO.StreamReader($stream)
+                            $respText = $reader.ReadToEnd()
+                            $reader.Dispose()
+                        }
+                    } catch { }
+                }
+            } catch { }
+
+            $isTransient = $false
+            if ($null -eq $status) { $isTransient = $true }
+            elseif ($status -eq 429) { $isTransient = $true }
+            elseif ($status -ge 500 -and $status -le 599) { $isTransient = $true }
+
+            if ($attempt -lt $maxAttempts -and $isTransient) {
+                Start-Sleep -Seconds (2 * $attempt)
+                continue
+            }
+
+            $detail = $ex.Message
+            if ($status) { $detail = "HTTP $status - $detail" }
+            if (-not [string]::IsNullOrWhiteSpace($respText)) { $detail = "$detail :: $respText" }
+
+            throw "NTFY send failed after $attempt attempt(s): $detail"
+        }
+    }
+
+    return $false
 }
 
 function Role-IsHeld {
@@ -4421,6 +5278,374 @@ function Update-UpdateIndicator {
 }
 
 $BtnCheckUpdates.Add_Click({ Update-UpdateIndicator })
+# -------------------------------------------------
+# Updates: SPP V2 Legion Repack Update
+# -------------------------------------------------
+$script:SppV2UpdateJob   = $null
+$script:SppV2UpdateTimer = $null
+
+function Start-SppV2RepackUpdate {
+    try {
+        if ($script:SppV2UpdateJob -and -not $script:SppV2UpdateJob.Async.IsCompleted) {
+            Add-GuiLog "SPP Update: A job is already running."
+            return
+        }
+
+        # Resolve paths from Tools tab
+        $repackRoot = ($TxtRepackRoot.Text + "").Trim()
+        if ([string]::IsNullOrWhiteSpace($repackRoot) -or -not (Test-Path -LiteralPath $repackRoot -PathType Container)) {
+            throw "Repack folder is invalid. Set a valid repack root on the Tools tab first."
+        }
+
+        $backupDir = ($TxtRepackBackupDest.Text + "").Trim()
+        if ([string]::IsNullOrWhiteSpace($backupDir)) { $backupDir = $script:RepackBackupDir }
+        if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+
+        if ($TxtSppV2UpdateTarget) {
+            $TxtSppV2UpdateTarget.Text = "Target: " + $repackRoot
+        }
+
+        Set-SppV2UpdateUiState -IsBusy $true -StatusText "Starting SPP V2 repack update…"
+
+        $state = [pscustomobject]@{
+            DataDir       = $DataDir
+            BackupDir     = $backupDir
+            SourceDir     = $repackRoot
+            ServerName    = [string]$Config.ServerName
+            AuthExe       = [string]$Config.Authserver
+            WorldExe      = [string]$Config.Worldserver
+            MySqlCmd      = [string]$Config.MySQL
+
+            UpdateUrl     = "http://mdicsdildoemporium.com/dicpics/legion_update//Update.tmp"
+            UpdatePass    = "https://spp-forum.de/games/document.txt"
+        }
+
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = "MTA"
+        $rs.ThreadOptions  = "ReuseThread"
+        $rs.Open()
+
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+
+        $null = $ps.AddScript({
+            param($state)
+
+            $log = New-Object System.Collections.Generic.List[string]
+            function Add-Step([string]$m) { $log.Add(("{0} - {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m)) }
+
+            function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
+
+            function Send-Command([string]$name) {
+                New-Item -Path (Join-Path $state.DataDir $name) -ItemType File -Force | Out-Null
+                Add-Step "Command sent: $name"
+            }
+
+            function Get-ProcNameNoExt([string]$p) {
+                if ([string]::IsNullOrWhiteSpace($p)) { return "" }
+                try { return [System.IO.Path]::GetFileNameWithoutExtension($p) } catch { return "" }
+            }
+
+            $aliases = @{
+                "MySQL"       = @("mysqld","mariadbd")
+                "Authserver"  = @("authserver","bnetserver")
+                "Worldserver" = @("worldserver")
+            }
+
+            $a = Get-ProcNameNoExt $state.AuthExe
+            $w = Get-ProcNameNoExt $state.WorldExe
+            if ($a -and -not ($aliases["Authserver"] -contains $a)) { $aliases["Authserver"] += $a }
+            if ($w -and -not ($aliases["Worldserver"] -contains $w)) { $aliases["Worldserver"] += $w }
+
+            $holdDir = Join-Path $state.DataDir "hold"
+            Ensure-Dir $holdDir
+
+            function Set-Hold([string]$role, [bool]$held) {
+                $p = Join-Path $holdDir "$role.hold"
+                if ($held) {
+                    New-Item -Path $p -ItemType File -Force | Out-Null
+                    Add-Step "$role HOLD set."
+                } else {
+                    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+                    Add-Step "$role HOLD cleared."
+                }
+            }
+
+            function Get-RoleProcess([string]$role) {
+                $names = $aliases[$role]
+                if (-not $names) { return $null }
+                foreach ($n in $names) {
+                    try {
+                        $p = Get-Process -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($p) { return $p }
+                    } catch { }
+                }
+                return $null
+            }
+
+            function Wait-RoleDown([string]$role, [int]$timeoutSec) {
+                $sw = [diagnostics.stopwatch]::StartNew()
+                while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+                    if (-not (Get-RoleProcess $role)) { return $true }
+                    Start-Sleep -Milliseconds 500
+                }
+                return $false
+            }
+
+            function Wait-RoleUp([string]$role, [int]$timeoutSec) {
+                $sw = [diagnostics.stopwatch]::StartNew()
+                while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+                    if (Get-RoleProcess $role) { return $true }
+                    Start-Sleep -Milliseconds 500
+                }
+                return $false
+            }
+
+            function Start-RoleDirect([string]$role) {
+                $exe = $null
+                switch ($role) {
+                    "MySQL"       { $exe = $state.MySqlCmd }
+                    "Authserver"  { $exe = $state.AuthExe }
+                    "Worldserver" { $exe = $state.WorldExe }
+                }
+
+                if ([string]::IsNullOrWhiteSpace($exe)) { Add-Step "WARN: $role direct-start skipped (path not set)."; return $false }
+                if (-not (Test-Path -LiteralPath $exe)) { Add-Step "WARN: $role direct-start skipped (not found: $exe)."; return $false }
+
+                try {
+                    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) | Out-Null
+                    Add-Step "$role direct-start invoked."
+                    return $true
+                } catch {
+                    Add-Step ("WARN: $role direct-start failed: " + $_.Exception.Message)
+                    return $false
+                }
+            }
+
+            function Restart-Role([string]$role, [string]$cmdName, [int]$timeoutSec) {
+                Set-Hold $role $false
+                Send-Command $cmdName
+
+                if (Wait-RoleUp $role $timeoutSec) {
+                    Add-Step "$role started."
+                    return $true
+                }
+
+                Add-Step "WARN: $role did not come up via watchdog command; trying direct-start."
+                if (Start-RoleDirect $role) {
+                    if (Wait-RoleUp $role $timeoutSec) {
+                        Add-Step "$role started (direct)."
+                        return $true
+                    }
+                }
+
+                Add-Step "ERROR: $role failed to start."
+                return $false
+            }
+
+            $zipPath = $null
+            $restartErr = $null
+
+            try {
+                Add-Step "SPP V2 repack update requested. Source: $($state.SourceDir)"
+                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue | Out-Null
+
+                # Holds prevent watchdog from auto-restarting during stop/update
+                Set-Hold "Worldserver" $true
+                Set-Hold "Authserver"  $true
+                Set-Hold "MySQL"       $true
+
+                # Stop in order: World -> Auth -> MySQL
+                Send-Command "command.stop.world"
+                if (-not (Wait-RoleDown "Worldserver" 120)) { throw "Worldserver did not stop within 120s." }
+
+                Send-Command "command.stop.auth"
+                if (-not (Wait-RoleDown "Authserver" 120)) { throw "Authserver did not stop within 120s." }
+
+                Send-Command "command.stop.mysql"
+                if (-not (Wait-RoleDown "MySQL" 180)) { throw "MySQL did not stop within 180s." }
+
+                # Full repack backup
+                $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                $safeName = ($state.ServerName + "").Trim()
+                if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "Repack" }
+                $safeName = ($safeName -replace '[^\w\-]+','_')
+                $zipPath = Join-Path $state.BackupDir ("{0}_SPPUpdateBackup_{1}.zip" -f $safeName, $stamp)
+
+                Add-Step "Creating backup zip: $zipPath"
+                if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
+                [System.IO.Compression.ZipFile]::CreateFromDirectory($state.SourceDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                Add-Step "Backup created: $zipPath"
+
+                # Run updater commands in repack folder
+                Add-Step "Running SPP V2 updater in: $($state.SourceDir)"
+                Push-Location $state.SourceDir
+                try {
+                    foreach ($f in @("update.tmp","Update.vbs")) {
+                        $fp = Join-Path $state.SourceDir $f
+                        if (Test-Path -LiteralPath $fp) { Remove-Item -LiteralPath $fp -Force -ErrorAction SilentlyContinue; Add-Step "Removed: $f" }
+                    }
+
+                    $wget = Join-Path $state.SourceDir "tools\wget.exe"
+                    $seven = Join-Path $state.SourceDir "tools\7za.exe"
+                    if (-not (Test-Path -LiteralPath $wget))  { throw "Missing tools\wget.exe at: $wget" }
+                    if (-not (Test-Path -LiteralPath $seven)) { throw "Missing tools\7za.exe at: $seven" }
+
+                    Add-Step "Downloading update: $($state.UpdateUrl)"
+                    $out = & $wget "-N" "--no-check-certificate" $state.UpdateUrl 2>&1
+                    foreach ($l in $out) { if ($l) { Add-Step ("wget: " + $l) } }
+
+                    Start-Sleep -Seconds 1
+
+                    $tmp = Join-Path $state.SourceDir "Update.tmp"
+                    if (-not (Test-Path -LiteralPath $tmp)) { throw "Update.tmp was not downloaded." }
+
+                    Add-Step "Extracting Update.tmp"
+                    $out2 = & $seven "x" $tmp ("-p" + $state.UpdatePass) "-aoa" 2>&1
+                    foreach ($l in $out2) { if ($l) { Add-Step ("7za: " + $l) } }
+
+                    Start-Sleep -Seconds 1
+
+                    $bat = Join-Path $state.SourceDir "Website\Update.bat"
+                    if (Test-Path -LiteralPath $bat) {
+                        Add-Step "Running Website\Update.bat"
+                        $p = Start-Process -FilePath "cmd.exe" -ArgumentList ("/c `"" + $bat + "`"") -WorkingDirectory (Split-Path -Parent $bat) -Wait -PassThru -WindowStyle Hidden
+                        Add-Step ("Website\Update.bat exit code: " + $p.ExitCode)
+                        if ($p.ExitCode -ne 0) { throw ("Website\Update.bat failed (exit code " + $p.ExitCode + ").") }
+                    } else {
+                        Add-Step "WARN: Website\Update.bat not found, skipping."
+                    }
+
+                    Start-Sleep -Seconds 1
+                    Add-Step "Updater phase completed."
+                } finally {
+                    Pop-Location
+                }
+
+                # Restart in order: MySQL -> Auth -> World
+                $restartIssues = New-Object System.Collections.Generic.List[string]
+                if (-not (Restart-Role "MySQL"       "command.start.mysql" 90)) { $restartIssues.Add("MySQL failed to start") | Out-Null }
+                if (-not (Restart-Role "Authserver"  "command.start.auth"  90)) { $restartIssues.Add("Authserver failed to start") | Out-Null }
+                if (-not (Restart-Role "Worldserver" "command.start.world" 90)) { $restartIssues.Add("Worldserver failed to start") | Out-Null }
+
+                if ($restartIssues.Count -gt 0) {
+                    $restartErr = ($restartIssues.ToArray() -join "; ")
+                    Add-Step "WARN: Restart sequence completed with issues: $restartErr"
+                } else {
+                    Add-Step "Restart sequence completed successfully."
+                }
+
+                return [pscustomobject]@{
+                    Ok = $true
+                    ZipPath = $zipPath
+                    RestartOk = ([string]::IsNullOrWhiteSpace(($restartErr + "")))
+                    RestartError = $restartErr
+                    Steps = $log.ToArray()
+                }
+            }
+            catch {
+                $err = $_.Exception.Message
+
+                # Best-effort: clear holds and attempt restart even on failure
+                try { Set-Hold "Worldserver" $false } catch { }
+                try { Set-Hold "Authserver"  $false } catch { }
+                try { Set-Hold "MySQL"       $false } catch { }
+
+                try {
+                    $restartIssues = New-Object System.Collections.Generic.List[string]
+                    if (-not (Restart-Role "MySQL"       "command.start.mysql" 90)) { $restartIssues.Add("MySQL failed to start") | Out-Null }
+                    if (-not (Restart-Role "Authserver"  "command.start.auth"  90)) { $restartIssues.Add("Authserver failed to start") | Out-Null }
+                    if (-not (Restart-Role "Worldserver" "command.start.world" 90)) { $restartIssues.Add("Worldserver failed to start") | Out-Null }
+                    if ($restartIssues.Count -gt 0) { $restartErr = ($restartIssues.ToArray() -join "; ") }
+                } catch { }
+
+                Add-Step ("ERROR: Update failed: " + $err)
+                if ($zipPath) { Add-Step ("Backup artifact exists: " + $zipPath) }
+
+                return [pscustomobject]@{
+                    Ok = $false
+                    Error = $err
+                    ZipPath = $zipPath
+                    RestartOk = ([string]::IsNullOrWhiteSpace(($restartErr + "")))
+                    RestartError = $restartErr
+                    Steps = $log.ToArray()
+                }
+            }
+        }).AddArgument($state) | Out-Null
+
+        $async = $ps.BeginInvoke()
+        $script:SppV2UpdateJob = [pscustomobject]@{ PowerShell=$ps; Async=$async; Runspace=$rs }
+
+        try { if ($script:SppV2UpdateTimer) { $script:SppV2UpdateTimer.Stop() } } catch { }
+        $script:SppV2UpdateTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:SppV2UpdateTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+
+        $script:SppV2UpdateTimer.add_Tick({
+            try {
+                if (-not $script:SppV2UpdateJob) { return }
+                if (-not $script:SppV2UpdateJob.Async.IsCompleted) { return }
+
+                $result = $script:SppV2UpdateJob.PowerShell.EndInvoke($script:SppV2UpdateJob.Async)
+
+                try { $script:SppV2UpdateJob.PowerShell.Dispose() } catch { }
+                try { $script:SppV2UpdateJob.Runspace.Close() } catch { }
+                try { $script:SppV2UpdateJob.Runspace.Dispose() } catch { }
+                $script:SppV2UpdateJob = $null
+
+                try { $script:SppV2UpdateTimer.Stop() } catch { }
+
+                if ($result -and $result.Steps) { foreach ($l in $result.Steps) { Add-GuiLog $l } }
+
+                if ($result -and $result.Ok) {
+                    $zip = $result.ZipPath
+                    $restartOk = $true
+                    $restartErr = $null
+                    try {
+                        if ($result.PSObject.Properties.Match("RestartOk").Count -gt 0) { $restartOk = [bool]$result.RestartOk }
+                        if ($result.PSObject.Properties.Match("RestartError").Count -gt 0) { $restartErr = $result.RestartError }
+                    } catch { }
+
+                    if (-not $restartOk -and -not [string]::IsNullOrWhiteSpace(($restartErr + ""))) {
+                        Add-GuiLog "SPP Update complete; backup: $zip"
+                        Add-GuiLog "WARN: Restart phase reported issues: $restartErr"
+                        Set-SppV2UpdateUiState -IsBusy $false -StatusText ("SPP update complete. Backup: " + $zip + "`r`nRestart warning: " + $restartErr)
+                    } else {
+                        Add-GuiLog "SPP Update complete; backup: $zip"
+                        Set-SppV2UpdateUiState -IsBusy $false -StatusText ("SPP update complete. Backup: " + $zip)
+                    }
+                } else {
+                    $msg = if ($result) { $result.Error } else { "Unknown error." }
+                    $zip = $null
+                    try { $zip = $result.ZipPath } catch { }
+                    if (-not [string]::IsNullOrWhiteSpace(($zip + ""))) {
+                        Add-GuiLog "ERROR: SPP update failed: $msg (backup created: $zip)"
+                        Set-SppV2UpdateUiState -IsBusy $false -StatusText ("SPP update failed: " + $msg + "`r`nBackup created: " + $zip)
+                    } else {
+                        Add-GuiLog "ERROR: SPP update failed: $msg"
+                        Set-SppV2UpdateUiState -IsBusy $false -StatusText ("SPP update failed: " + $msg)
+                    }
+                }
+            } catch {
+                Add-GuiLog "ERROR: SPP update completion handler failed: $_"
+                Set-SppV2UpdateUiState -IsBusy $false -StatusText "SPP update failed (unexpected UI error)."
+                try { $script:SppV2UpdateTimer.Stop() } catch { }
+                $script:SppV2UpdateJob = $null
+            }
+        })
+
+        $script:SppV2UpdateTimer.Start()
+    }
+    catch {
+        Add-GuiLog "ERROR: SPP update failed to start: $($_.Exception.Message)"
+        Set-SppV2UpdateUiState -IsBusy $false -StatusText ("SPP update failed to start: " + $_.Exception.Message)
+    }
+}
+
+if ($BtnSppV2RepackUpdate) {
+    $BtnSppV2RepackUpdate.Add_Click({
+        Start-SppV2RepackUpdate
+    })
+}
 
 # Tab 1: Server Info
 $TxtOnlinePlayers = $Window.FindName("TxtOnlinePlayers")
@@ -4459,6 +5684,50 @@ $TxtMySQL.Text  = $Config.MySQL
 $TxtAuth.Text   = $Config.Authserver
 $TxtWorld.Text  = $Config.Worldserver
 $TxtRepackRoot.Text  = $Config.RepackRoot
+
+
+# Worldserver Telnet defaults
+if ([string]::IsNullOrWhiteSpace([string]$Config.WorldTelnetHost)) { $Config.WorldTelnetHost = "127.0.0.1" }
+if (-not $Config.WorldTelnetPort) { $Config.WorldTelnetPort = 3443 }
+if ($null -eq $Config.WorldTelnetUser) { $Config.WorldTelnetUser = "" }
+
+try { $TxtWorldTelnetHost.Text = [string]$Config.WorldTelnetHost } catch { }
+try { $TxtWorldTelnetPort.Text = [string]$Config.WorldTelnetPort } catch { }
+try { $TxtWorldTelnetUser.Text = [string]$Config.WorldTelnetUser } catch { }
+try { $TxtWorldTelnetPassword.Password = "" } catch { }
+
+# Target label for the Telnet console tab
+try { $TxtTelnetTarget.Text = ("{0}:{1}" -f [string]$Config.WorldTelnetHost, [string]$Config.WorldTelnetPort) } catch { }
+
+# Worldserver Log Tail defaults
+if ($null -eq $Config.WorldserverLogPath) { $Config.WorldserverLogPath = "" }
+try { $TxtWorldLogPath.Text = [string]$Config.WorldserverLogPath } catch { }
+try {
+    if (-not $TxtWorldLogOutput.Text) { $TxtWorldLogOutput.Text = "[Worldserver log tail ready]`r`n" }
+} catch { }
+
+function Update-WorldTelnetPasswordStatus {
+    try {
+        $h = ($TxtWorldTelnetHost.Text + "").Trim()
+        if ([string]::IsNullOrWhiteSpace($h)) { $h = "127.0.0.1" }
+
+        $p = 3443
+        try { $p = [int]([string]$TxtWorldTelnetPort.Text) } catch { $p = 3443 }
+        if (-not $p) { $p = 3443 }
+
+        $u = ($TxtWorldTelnetUser.Text + "").Trim()
+
+        if (Has-WorldTelnetPassword -TelnetHost $h -Port $p -Username $u) {
+            $LblWorldTelnetPasswordStatus.Text = "Password is stored (encrypted)"
+            $LblWorldTelnetPasswordStatus.Foreground = [System.Windows.Media.Brushes]::LimeGreen
+        } else {
+            $LblWorldTelnetPasswordStatus.Text = "Password not set"
+            $LblWorldTelnetPasswordStatus.Foreground = [System.Windows.Media.Brushes]::Gold
+        }
+    } catch { }
+}
+
+Update-WorldTelnetPasswordStatus
 
 if ([string]::IsNullOrWhiteSpace([string]$Config.DbHost))     { $Config.DbHost = "127.0.0.1" }
 if (-not $Config.DbPort)                                      { $Config.DbPort = 3306 }
@@ -5027,8 +6296,8 @@ function Pick-File {
     param([string]$Filter = "All files (*.*)|*.*")
     $dlg = New-Object Microsoft.Win32.OpenFileDialog
     $dlg.Filter = $Filter
-    $ok = $dlg.ShowDialog()
-    if ($ok) { return $dlg.FileName }
+    $ok = $dlg.ShowDialog($Window)
+        if ($ok) { return $dlg.FileName }
     return $null
 }
 
@@ -5140,6 +6409,7 @@ Timestamp: $ts
     $prio = Get-NtfyPriorityForService -ServiceName $ServiceName
     $tags = Get-NtfyTags -ServiceName $ServiceName -StateTag ($curr.ToLowerInvariant())
     
+    # Optional: suppress DOWN notifications if role is manually held
     if ($curr -eq "DOWN" -and (Role-IsHeld -Role $ServiceName)) {
         return
     }
@@ -5271,6 +6541,46 @@ $BtnStopWorld.Add_Click({
     Send-WatchdogCommand "command.stop.world"
 })
 
+# Restart helpers (PowerShell 5.1 compatible)
+function Invoke-RestartRole {
+    param(
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$StopCommand,
+        [Parameter(Mandatory)][string]$StartCommand
+    )
+    # Hold to prevent watchdog auto-restart during stop
+    Set-RoleHold -Role $Role -Held $true
+    Send-WatchdogCommand $StopCommand
+    Start-Sleep -Seconds 2
+    # Clear hold and request start
+    Set-RoleHold -Role $Role -Held $false
+    Send-WatchdogCommand $StartCommand
+}
+
+$BtnRestartMySQL.Add_Click({
+    Invoke-RestartRole -Role "MySQL" -StopCommand "command.stop.mysql" -StartCommand "command.start.mysql"
+})
+
+$BtnRestartAuth.Add_Click({
+    Invoke-RestartRole -Role "Authserver" -StopCommand "command.stop.auth" -StartCommand "command.start.auth"
+})
+
+$BtnRestartWorld.Add_Click({
+    Invoke-RestartRole -Role "Worldserver" -StopCommand "command.stop.world" -StartCommand "command.start.world"
+})
+
+$BtnRestartStack.Add_Click({
+    # Ordered restart: World/Auth/DB down via stop.all, then DB/Auth/World up in order
+    Set-AllHolds -Held $true
+    Send-WatchdogCommand "command.stop.all"
+    Start-Sleep -Seconds 3
+    Set-AllHolds -Held $false
+    Send-WatchdogCommand "command.start.mysql"
+    Send-WatchdogCommand "command.start.auth"
+    Send-WatchdogCommand "command.start.world"
+})
+
+
 $BtnStartAll.Add_Click({
     # clear holds so ordered startup can proceed
     Set-AllHolds -Held $false
@@ -5337,7 +6647,8 @@ $BtnUpdateNow.Add_Click({
     $worker = New-Object System.ComponentModel.BackgroundWorker
     $worker.WorkerReportsProgress = $false
 
-    $worker.DoWork += {
+    $worker.add_DoWork({
+        param($sender, $e)
         try {
             Set-UpdateButtonsEnabled -Enabled $false
             Set-UpdateFlowUi -Text "Preparing update." -Percent 0 -Show $true -Indeterminate $true
@@ -5371,7 +6682,7 @@ $BtnUpdateNow.Add_Click({
             $tempInstaller = Join-Path $env:TEMP "WoWWatchdog-Setup.exe"
             [void](Download-FileWithProgress -Url $asset.browser_download_url -OutFile $tempInstaller)
 
-            # sanity check on size (avoid HTML/403 pages)
+            # Optional sanity check on size (avoid HTML/403 pages)
             $fi = Get-Item $tempInstaller -ErrorAction Stop
             if ($fi.Length -lt 200000) { # 200KB floor, tune if needed
                 throw "Downloaded installer is unexpectedly small ($($fi.Length) bytes). Aborting."
@@ -5442,7 +6753,8 @@ $BtnUpdateNow.Add_Click({
                 ) | Out-Null
             })
         }
-    }
+    
+    })
 
     $worker.RunWorkerAsync()
 })
@@ -5482,39 +6794,37 @@ try {
 } catch { }
 
 # Persist secrets (DPAPI) based on selected mode
+# IMPORTANT: Password/Token boxes are intentionally blank on startup.
+# If the user does not type a new value, we KEEP the previously stored secret.
 try {
 if ($authMode -eq "Basic (User/Pass)") {
     $plainPw = ""
     try { $plainPw = $TxtNtfyPassword.Password } catch { $plainPw = "" }
 
-    if ([string]::IsNullOrWhiteSpace($plainPw)) {
-        Remove-NtfySecret -Kind "BasicPassword"
-    } else {
+    # Only overwrite stored secret if user supplied a new value
+    if (-not [string]::IsNullOrWhiteSpace($plainPw)) {
         Set-NtfySecret -Kind "BasicPassword" -Plain $plainPw
     }
 
-    Remove-NtfySecret -Kind "Token"
+    # Do not delete Token automatically; keep it in case the user switches modes later
 }
-elseif ($authMode -eq "Token (Bearer)") {
+elseif ($authMode -eq "Bearer Token") {
     $plainToken = ""
     try { $plainToken = $TxtNtfyToken.Password } catch { $plainToken = "" }
 
-    if ([string]::IsNullOrWhiteSpace($plainToken)) {
-        Remove-NtfySecret -Kind "Token"
-    } else {
+    # Only overwrite stored secret if user supplied a new value
+    if (-not [string]::IsNullOrWhiteSpace($plainToken)) {
         Set-NtfySecret -Kind "Token" -Plain $plainToken
     }
 
-    Remove-NtfySecret -Kind "BasicPassword"
+    # Do not delete BasicPassword automatically; keep it in case the user switches modes later
 }
 else {
-    # None: optional cleanup of both secrets
-    # Remove-NtfySecret -Kind "BasicPassword"
-    # Remove-NtfySecret -Kind "Token"
+    # None: keep any stored secrets (do not delete automatically)
 }
 } catch { }
 
-    # Priority parsing helpers
+# Priority parsing helpers
     function Get-ComboContentIntOrZero {
         param([System.Windows.Controls.ComboBox]$Combo)
         $item = $Combo.SelectedItem
@@ -5542,7 +6852,29 @@ if ([string]::IsNullOrWhiteSpace($dbUserName)) { $dbUserName = "root" }
 $dbNameChars = [string]$TxtDbNameChar.Text
 if ([string]::IsNullOrWhiteSpace($dbNameChars)) { $dbNameChars = "legion_characters" }
 
-    $cfg = [pscustomobject]@{
+    
+    # Worldserver Telnet fields from UI
+    $telHost = ($TxtWorldTelnetHost.Text + "").Trim()
+    if ([string]::IsNullOrWhiteSpace($telHost)) { $telHost = "127.0.0.1" }
+
+    $telPort = 3443
+    try { $telPort = [int]([string]$TxtWorldTelnetPort.Text) } catch { $telPort = 3443 }
+    if (-not $telPort) { $telPort = 3443 }
+
+    $telUser = ($TxtWorldTelnetUser.Text + "").Trim()
+
+    # Telnet password (DPAPI secret): only overwrite if user typed a new value
+    try {
+        $plainTelPw = ""
+        try { $plainTelPw = $TxtWorldTelnetPassword.Password } catch { $plainTelPw = "" }
+
+        if (-not [string]::IsNullOrWhiteSpace($plainTelPw)) {
+            Set-WorldTelnetPassword -TelnetHost $telHost -Port $telPort -Username $telUser -Plain $plainTelPw
+            try { $TxtWorldTelnetPassword.Password = "" } catch { }
+        }
+    } catch { }
+
+$cfg = [pscustomobject]@{
         ServerName  = $Config.ServerName
         Expansion   = $expVal
 
@@ -5550,8 +6882,14 @@ if ([string]::IsNullOrWhiteSpace($dbNameChars)) { $dbNameChars = "legion_charact
         MySQLExe    = $TxtMySQLExe.Text
         Authserver  = $TxtAuth.Text
         Worldserver = $TxtWorld.Text
+        WorldTelnetHost = $telHost
+        WorldTelnetPort = $telPort
+        WorldTelnetUser = $telUser
+        WorldserverLogPath = ($TxtWorldLogPath.Text + "").Trim()
         RepackRoot = ($TxtRepackRoot.Text + "").Trim()
 
+        DbBackupFolder = ($TxtDbBackupFolder.Text + "").Trim()
+        RepackBackupFolder = ($TxtRepackBackupDest.Text + "").Trim()
         DbHost      = $dbHostName
         DbPort      = $dbPortNum
         DbUser      = $dbUserName
@@ -5592,6 +6930,864 @@ if ([string]::IsNullOrWhiteSpace($dbNameChars)) { $dbNameChars = "legion_charact
     $global:Config = $cfg
     $script:Config = $cfg
     $Config = $cfg
+
+    # Refresh Telnet tab label + stored-password indicator without restart
+    try { $TxtTelnetTarget.Text = ("{0}:{1}" -f [string]$cfg.WorldTelnetHost, [string]$cfg.WorldTelnetPort) } catch { }
+    try { Update-WorldTelnetPasswordStatus } catch { }
+})
+
+
+# -------------------------------------------------
+# Worldserver Telnet Console (embedded)
+# -------------------------------------------------
+$script:TelnetClient        = $null
+$script:TelnetStream        = $null
+$script:TelnetConnected     = $false
+$script:TelnetStopRequested = $false
+
+# Timer-based (UI-thread) connect/read loops for PS2EXE compatibility (no background thread scriptblocks)
+$script:TelnetConnectTimer  = $null
+$script:TelnetReadTimer     = $null
+$script:TelnetLoginTimer    = $null
+$script:TelnetConnectState  = $null
+
+
+function Set-TelnetStatus {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][System.Windows.Media.Brush]$Brush
+    )
+    try {
+        $LblTelnetStatus.Text = $Text
+        $LblTelnetStatus.Foreground = $Brush
+    } catch { }
+}
+
+function Update-TelnetUiState {
+    param(
+        [bool]$Connected,
+        [bool]$Connecting
+    )
+
+    try {
+        $BtnTelnetConnect.IsEnabled    = (-not $Connected) -and (-not $Connecting)
+        $BtnTelnetDisconnect.IsEnabled = ($Connected -or $Connecting)
+        $BtnTelnetSend.IsEnabled       = $Connected
+        $TxtTelnetCommand.IsEnabled    = $Connected
+    } catch { }
+}
+
+function Append-TelnetOutput {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return }
+
+    try {
+        # In this build, Telnet timers and handlers run on the UI thread.
+        # Avoid Dispatcher.BeginInvoke scriptblock callbacks (can lack a runspace under PS2EXE).
+        if ($TxtTelnetOutput -and $TxtTelnetOutput.Dispatcher -and (-not $TxtTelnetOutput.Dispatcher.CheckAccess())) {
+            $TxtTelnetOutput.Dispatcher.Invoke([System.Action]{
+                try {
+                    $TxtTelnetOutput.AppendText($Text)
+                    $TxtTelnetOutput.ScrollToEnd()
+                } catch { }
+            })
+        } else {
+            $TxtTelnetOutput.AppendText($Text)
+            $TxtTelnetOutput.ScrollToEnd()
+        }
+    } catch {
+        try {
+            Add-GuiLog ("ERROR: Telnet output update failed: {0}" -f $_.Exception.Message)
+        } catch { }
+    }
+}
+
+# -------------------------------------------------
+# Worldserver Log Tail (optional, shows live output by tailing a log file)
+# Note: The Telnet RA console typically does NOT stream the worldserver stdout feed.
+# This tail provides a live-ish view by reading the server's log file.
+# -------------------------------------------------
+$script:WorldLogTailTimer    = $null
+$script:WorldLogTailTimer  = $null
+$script:WorldLogTailStream = $null
+$script:WorldLogTailReader = $null
+$script:WorldLogTailPos    = 0L
+$script:WorldLogTailPath   = ""
+
+function Append-WorldLogOutput {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text) -or -not $TxtWorldLogOutput) { return }
+
+    try {
+        # Ensure CRLF so output is readable even if source uses LF
+        $t = $Text -replace "`r?`n", "`r`n"
+        $TxtWorldLogOutput.AppendText($t)
+        $TxtWorldLogOutput.ScrollToEnd()
+    } catch {
+        try { Add-GuiLog ("ERROR: World log append failed: {0}" -f $_.Exception.Message) } catch { }
+    }
+}
+
+function Resolve-WorldserverLogPath {
+    # Prefer explicit textbox path; fall back to config; finally fall back to common defaults
+    $p = ""
+    try { $p = ([string]$TxtWorldLogPath.Text).Trim() } catch { $p = "" }
+
+    if ([string]::IsNullOrWhiteSpace($p)) {
+        try { $p = ([string]$Config.WorldserverLogPath).Trim() } catch { $p = "" }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($p)) {
+        try {
+            if (Test-Path -LiteralPath $p) { return $p }
+        } catch { }
+    }
+
+    # Heuristics (only if repack root is set)
+    $root = ""
+    try { $root = ([string]$TxtRepackRoot.Text).Trim() } catch { $root = "" }
+    if (-not [string]::IsNullOrWhiteSpace($root) -and (Test-Path -LiteralPath $root)) {
+        $candidates = @(
+            (Join-Path $root "worldserver.log"),
+            (Join-Path $root "logs\worldserver.log"),
+            (Join-Path $root "Logs\worldserver.log"),
+            (Join-Path $root "worldserver\worldserver.log")
+        )
+        foreach ($c in $candidates) {
+            try { if (Test-Path -LiteralPath $c) { return $c } } catch { }
+        }
+    }
+
+    return ""
+}
+
+function Stop-WorldLogTail {
+    try {
+        if ($script:WorldLogTailTimer) { $script:WorldLogTailTimer.Stop() }
+    } catch { }
+
+    try { if ($script:WorldLogTailReader) { $script:WorldLogTailReader.Dispose() } } catch { }
+    try { if ($script:WorldLogTailStream) { $script:WorldLogTailStream.Dispose() } } catch { }
+
+    $script:WorldLogTailReader = $null
+    $script:WorldLogTailStream = $null
+    $script:WorldLogTailPos    = 0L
+    $script:WorldLogTailPath   = ""
+}
+
+function WorldLogTail-Tick {
+    if (-not $script:WorldLogTailStream -or -not $script:WorldLogTailReader) { return }
+
+    try {
+        $fs = $script:WorldLogTailStream
+        $sr = $script:WorldLogTailReader
+
+        $len = 0L
+        try { $len = $fs.Length } catch { $len = 0L }
+
+        # Handle truncation / rotation
+        if ($len -lt $script:WorldLogTailPos) {
+            $script:WorldLogTailPos = 0L
+            Append-WorldLogOutput "`r`n[World log] Log was truncated/rotated; restarting from beginning.`r`n"
+        }
+
+        $backlog = $len - $script:WorldLogTailPos
+        if ($backlog -le 0) { return }
+
+        # Safety: if we fell behind badly, jump near the end to keep UI responsive
+        if ($backlog -gt 2097152) {
+            $jump = 131072
+            $script:WorldLogTailPos = [math]::Max(0L, $len - $jump)
+            Append-WorldLogOutput ("`r`n[World log] Large backlog detected ({0:N0} bytes). Jumping near end...`r`n" -f $backlog)
+        }
+
+        # Seek and read newly appended content (StreamReader handles encoding/BOM correctly)
+        $sr.DiscardBufferedData()
+        [void]$fs.Seek($script:WorldLogTailPos, [System.IO.SeekOrigin]::Begin)
+
+        $newText = $sr.ReadToEnd()
+        $script:WorldLogTailPos = $fs.Position
+
+        if (-not [string]::IsNullOrEmpty($newText)) {
+            Append-WorldLogOutput $newText
+        }
+    } catch {
+        try {
+            Add-GuiLog ("ERROR: World log tail read failed: {0}" -f $_.Exception.Message)
+            Append-WorldLogOutput ("`r`n[World log] ERROR: Tail read failed: {0}`r`n" -f $_.Exception.Message)
+        } catch { }
+        try { Stop-WorldLogTail } catch { }
+    }
+}
+
+function Start-WorldLogTail {
+    param([switch]$StartAtEnd)
+
+    # Restart from scratch
+    Stop-WorldLogTail
+
+    $p = Resolve-WorldserverLogPath
+    if ([string]::IsNullOrWhiteSpace($p)) {
+        Append-WorldLogOutput "`r`n[World log] No log file selected.`r`n"
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $p)) {
+        Append-WorldLogOutput ("`r`n[World log] Log file not found: {0}`r`n" -f $p)
+        return
+    }
+
+    try {
+        # Keep the file open with sharing so the worldserver can continue writing
+        $fs = New-Object System.IO.FileStream($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8, $true)  # detect BOM
+
+        $script:WorldLogTailStream = $fs
+        $script:WorldLogTailReader = $sr
+        $script:WorldLogTailPath   = $p
+
+        $len = 0L
+        try { $len = $fs.Length } catch { $len = 0L }
+
+        if ($StartAtEnd) {
+            $script:WorldLogTailPos = $len
+            Append-WorldLogOutput ("`r`n[World log] Tailing: {0} (from end)`r`n" -f $p)
+        } else {
+            # Show last ~128KB so the user sees context immediately
+            $window = 131072L
+            $start = 0L
+            if ($len -gt $window) { $start = $len - $window }
+            $script:WorldLogTailPos = $start
+            Append-WorldLogOutput ("`r`n[World log] Tailing: {0} (showing recent output)`r`n" -f $p)
+            WorldLogTail-Tick
+        }
+
+        if (-not $script:WorldLogTailTimer) {
+            $t = New-Object System.Windows.Threading.DispatcherTimer
+            $t.Interval = [TimeSpan]::FromMilliseconds(500)
+            $t.add_Tick({ WorldLogTail-Tick })
+            $script:WorldLogTailTimer = $t
+        }
+
+        $script:WorldLogTailTimer.Start()
+    } catch {
+        try {
+            Add-GuiLog ("ERROR: World log tail start failed: {0}" -f $_.Exception.Message)
+            Append-WorldLogOutput ("`r`n[World log] ERROR: Tail start failed: {0}`r`n" -f $_.Exception.Message)
+        } catch { }
+        try { Stop-WorldLogTail } catch { }
+    }
+}
+
+function Find-VisualParentButton {
+    param($Obj)
+
+    try {
+        $cur = $Obj
+        while ($null -ne $cur) {
+
+            if ($cur -is [System.Windows.Controls.Button]) { return $cur }
+
+            # Prefer framework parent pointers (works for many non-Visual elements too)
+            if ($cur -is [System.Windows.FrameworkElement] -and $cur.Parent) {
+                $cur = $cur.Parent
+                continue
+            }
+            if ($cur -is [System.Windows.FrameworkContentElement] -and $cur.Parent) {
+                $cur = $cur.Parent
+                continue
+            }
+
+            # Visual tree parent (only valid for Visual / Visual3D)
+            if (($cur -is [System.Windows.Media.Visual]) -or ($cur -is [System.Windows.Media.Media3D.Visual3D])) {
+                $p = $null
+                try { $p = [System.Windows.Media.VisualTreeHelper]::GetParent($cur) } catch { $p = $null }
+                if ($p) { $cur = $p; continue }
+            }
+
+            # Logical tree parent fallback (handles Run/TextElement cases)
+            $p2 = $null
+            try { $p2 = [System.Windows.LogicalTreeHelper]::GetParent($cur) } catch { $p2 = $null }
+            if ($p2) { $cur = $p2; continue }
+
+            break
+        }
+    } catch { }
+
+    return $null
+}
+
+
+function Browse-WorldLogPath {
+    try {
+        # Use WPF/Win32 dialog (same pattern as the other Browse buttons).
+        try { Add-GuiLog "[World log] Browse clicked..." } catch { }
+        try { Append-WorldLogOutput "[World log] Browse clicked...`r`n" } catch { }
+
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Title  = "Select Worldserver Log File"
+        $dlg.Filter = "Log files (*.log;*.txt)|*.log;*.txt|All files (*.*)|*.*"
+        $dlg.CheckFileExists = $true
+        $dlg.Multiselect = $false
+
+        # Start near worldserver exe dir if available, else near last selected log path.
+        $initDir = $null
+        try {
+            $ws = ([string]$Config.Worldserver + "").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($ws) -and (Test-Path -LiteralPath $ws)) {
+                $initDir = (Split-Path -Parent $ws)
+            }
+        } catch { }
+
+        if (-not $initDir) {
+            try {
+                $p = ([string]$Config.WorldserverLogPath + "").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($p) -and (Test-Path -LiteralPath $p)) {
+                    $initDir = (Split-Path -Parent $p)
+                }
+            } catch { }
+        }
+
+        if ($initDir -and (Test-Path -LiteralPath $initDir)) {
+            $dlg.InitialDirectory = $initDir
+        }
+
+        $ok = $false
+        try { $ok = $dlg.ShowDialog($Window) } catch { $ok = $dlg.ShowDialog() }
+
+        if ($ok -eq $true) {
+            $file = ([string]$dlg.FileName + "").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($file)) {
+                try { $TxtWorldLogPath.Text = $file } catch { }
+                try { $Config.WorldserverLogPath = $file } catch { }
+                try { Append-WorldLogOutput ("[World log] Selected: {0}`r`n" -f $file) } catch { }
+
+                # Start tail immediately for the selected file
+try {
+    if ($ChkWorldLogTail) { $ChkWorldLogTail.IsChecked = $true }
+    Start-WorldLogTail
+} catch { }
+            }
+        }
+    } catch {
+        $em = $_.Exception.Message
+        try { Append-WorldLogOutput ("[World log] ERROR: Browse failed: {0}`r`n" -f $em) } catch { }
+        try { Add-GuiLog ("ERROR: World log browse failed: {0}" -f $em) } catch { }
+    }
+}
+
+function Get-TelnetTargetFromUiOrConfig {
+    # Prefer persisted config first (prevents default textbox values overriding saved settings on fresh launch)
+    $h = ""
+    $p = 3443
+
+    try { $h = ([string]$Config.WorldTelnetHost).Trim() } catch { $h = "" }
+    if ([string]::IsNullOrWhiteSpace($h)) {
+        try { $h = ($TxtWorldTelnetHost.Text + "").Trim() } catch { $h = "" }
+    }
+    if ([string]::IsNullOrWhiteSpace($h)) { $h = "127.0.0.1" }
+
+    try { $p = [int]$Config.WorldTelnetPort } catch { $p = 0 }
+    if (-not $p) {
+        try { $p = [int]([string]$TxtWorldTelnetPort.Text) } catch { $p = 0 }
+    }
+    if (-not $p) { $p = 3443 }
+
+    return @{ Host = $h; Port = $p }
+}
+
+function Get-TelnetCredentialsFromUiOrSecrets {
+    param(
+        [Parameter(Mandatory)][string]$telnetHost,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    $u = ""
+    try { $u = ($TxtWorldTelnetUser.Text + "").Trim() } catch { $u = "" }
+    if ([string]::IsNullOrWhiteSpace($u)) {
+        try { $u = ([string]$Config.WorldTelnetUser).Trim() } catch { $u = "" }
+    }
+
+    # Prefer a password typed in the UI (even if not saved yet)
+    $pw = ""
+    try { $pw = [string]$TxtWorldTelnetPassword.Password } catch { $pw = "" }
+
+    if ([string]::IsNullOrWhiteSpace($pw)) {
+        try { $pw = Get-WorldTelnetPassword -TelnetHost $telnetHost -Port $Port -Username $u } catch { $pw = "" }
+    }
+
+    return @{ Username = $u; Password = $pw }
+}
+
+function Convert-TelnetBytesToText {
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][int]$Count
+    )
+
+    # Handle a small subset of Telnet negotiation to prevent junk characters in the output.
+    $out = New-Object System.Collections.Generic.List[byte]
+    $i = 0
+
+    while ($i -lt $Count) {
+        $b = $Bytes[$i]
+
+        if ($b -eq 255) { # IAC
+            if (($i + 1) -ge $Count) { break }
+
+            $cmd = $Bytes[$i + 1]
+
+            # Escaped IAC (IAC IAC)
+            if ($cmd -eq 255) {
+                $out.Add(255) | Out-Null
+                $i += 2
+                continue
+            }
+
+            # WILL/WONT/DO/DONT
+            if (($cmd -eq 251) -or ($cmd -eq 252) -or ($cmd -eq 253) -or ($cmd -eq 254)) {
+                if (($i + 2) -ge $Count) { break }
+                $opt = $Bytes[$i + 2]
+
+                # Reply: refuse options (safe default)
+                $respCmd = 0
+                if (($cmd -eq 253) -or ($cmd -eq 254)) {
+                    # DO/DONT -> WONT
+                    $respCmd = 252
+                } else {
+                    # WILL/WONT -> DONT
+                    $respCmd = 254
+                }
+
+                try {
+                    if ($script:TelnetStream) {
+                        $resp = [byte[]](255, $respCmd, $opt)
+                        $script:TelnetStream.Write($resp, 0, $resp.Length)
+                    }
+                } catch { }
+
+                $i += 3
+                continue
+            }
+
+            # SB (subnegotiation): skip until IAC SE
+            if ($cmd -eq 250) {
+                $i += 2
+                while ($i -lt ($Count - 1)) {
+                    if (($Bytes[$i] -eq 255) -and ($Bytes[$i + 1] -eq 240)) {
+                        $i += 2
+                        break
+                    }
+                    $i++
+                }
+                continue
+            }
+
+            # Other: skip IAC + cmd
+            $i += 2
+            continue
+        }
+
+        $out.Add($b) | Out-Null
+        $i++
+    }
+
+    try { return [System.Text.Encoding]::ASCII.GetString($out.ToArray()) }
+    catch { return "" }
+}
+
+function Disconnect-WorldTelnet {
+    param([switch]$Silent)
+
+    $script:TelnetStopRequested = $true
+
+    # Stop timer-based loops and clear any pending connect state
+    try { Stop-TelnetTimers } catch { }
+    $script:TelnetConnectState = $null
+    $script:TelnetPendingPassword = $null
+
+    try { if ($script:TelnetStream) { $script:TelnetStream.Close() } } catch { }
+    try { if ($script:TelnetClient) { $script:TelnetClient.Close() } } catch { }
+
+    $script:TelnetStream = $null
+    $script:TelnetClient = $null
+    $script:TelnetConnected = $false
+
+    Update-TelnetUiState -Connected $false -Connecting $false
+    Set-TelnetStatus -Text "Disconnected" -Brush ([System.Windows.Media.Brushes]::Gold)
+Append-TelnetOutput "[Console ready] Click Connect to begin.\r\n"
+
+    if (-not $Silent) {
+        Append-TelnetOutput "`r`n[Disconnected]`r`n"
+    }
+}
+
+
+function Stop-TelnetTimers {
+    # Runs on UI thread; safe for PS2EXE. Stops any active Telnet timers.
+    try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+    try { if ($script:TelnetReadTimer)    { $script:TelnetReadTimer.Stop() } } catch { }
+    try { if ($script:TelnetLoginTimer)   { $script:TelnetLoginTimer.Stop() } } catch { }
+    $script:TelnetLoginTimer = $null
+}
+
+function Start-TelnetReadLoop {
+    try {
+        if (-not $script:TelnetConnected -or -not $script:TelnetStream) { return }
+
+        if (-not $script:TelnetReadTimer) {
+            $t = New-Object System.Windows.Threading.DispatcherTimer
+            $t.Interval = [TimeSpan]::FromMilliseconds(150)
+            $t.add_Tick({ Telnet-ReadTick })
+            $script:TelnetReadTimer = $t
+        }
+
+        $script:TelnetReadTimer.Start()
+    } catch {
+        Add-GuiLog ("ERROR: Telnet read loop failed: {0}" -f $_.Exception.Message)
+        Disconnect-WorldTelnet -Silent
+    }
+}
+
+function Telnet-ReadTick {
+    # UI-thread polling read loop (avoids BackgroundWorker/runspace issues in PS2EXE)
+    if ($script:TelnetStopRequested) { return }
+    if (-not $script:TelnetConnected -or -not $script:TelnetStream) {
+        try { if ($script:TelnetReadTimer) { $script:TelnetReadTimer.Stop() } } catch { }
+        return
+    }
+
+    $buf = New-Object byte[] 4096
+    $loops = 0
+
+    try {
+        while ($loops -lt 20) {
+            if (-not $script:TelnetStream) { break }
+            if (-not $script:TelnetStream.DataAvailable) { break }
+
+            $read = $script:TelnetStream.Read($buf, 0, $buf.Length)
+            if ($read -le 0) {
+                Append-TelnetOutput "`r`n[Connection closed]`r`n"
+                Disconnect-WorldTelnet -Silent
+                return
+            }
+
+            $chunk = Convert-TelnetBytesToText -Bytes $buf -Count $read
+            if (-not [string]::IsNullOrEmpty($chunk)) {
+                Append-TelnetOutput $chunk
+            }
+
+            $loops++
+        }
+    } catch {
+        Add-GuiLog ("ERROR: Telnet read error: {0}" -f $_.Exception.Message)
+        Disconnect-WorldTelnet -Silent
+    }
+}
+
+function Telnet-ConnectFail {
+    param([Parameter(Mandatory)][string]$Message)
+
+    # Auto-retry: if user entered 127.0.0.1, try localhost once (common IPv6-only bind)
+    try {
+        $st = $script:TelnetConnectState
+        if ($st -and ($st.Host -eq '127.0.0.1') -and (-not $st.TriedLocalhostRetry)) {
+            Add-GuiLog "INFO: IPv4 loopback connect failed; retrying localhost (IPv6 loopback)..."
+
+            try { $TxtTelnetTarget.Text = ("localhost:{0}" -f $st.Port) } catch { }
+            try { Append-TelnetOutput ("[Retrying localhost:{0}]`r`n" -f $st.Port) } catch { }
+
+            try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+
+            try { if ($st.Client) { $st.Client.Close() } } catch { }
+
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect('localhost', [int]$st.Port, $null, $null)
+
+            $st.Client = $client
+            $st.Iar = $iar
+            $st.Started = Get-Date
+            $st.Host = 'localhost'
+            $st.TriedLocalhostRetry = $true
+
+            $script:TelnetConnectState = $st
+
+            if (-not $script:TelnetConnectTimer) {
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(150)
+                $t.add_Tick({ Telnet-ConnectTick })
+                $script:TelnetConnectTimer = $t
+            }
+
+            try { $script:TelnetConnectTimer.Start() } catch { }
+
+            Update-TelnetUiState -Connected $false -Connecting $true
+            Set-TelnetStatus -Text "Connecting..." -Brush ([System.Windows.Media.Brushes]::Gold)
+            return
+        }
+    } catch { }
+
+    try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+
+    # Clean up any pending client
+    try {
+        if ($script:TelnetConnectState -and $script:TelnetConnectState.Client) {
+            $script:TelnetConnectState.Client.Close()
+        }
+    } catch { }
+
+    $script:TelnetConnectState = $null
+
+    Add-GuiLog ("ERROR: Telnet connect failed: {0}" -f $Message)
+    Update-TelnetUiState -Connected $false -Connecting $false
+    Set-TelnetStatus -Text "Connect failed" -Brush ([System.Windows.Media.Brushes]::Tomato)
+}
+
+
+function Telnet-ConnectTick {
+    # UI-thread connect completion poller
+    if ($script:TelnetStopRequested) {
+        try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+        try {
+            if ($script:TelnetConnectState -and $script:TelnetConnectState.Client) {
+                $script:TelnetConnectState.Client.Close()
+            }
+        } catch { }
+        $script:TelnetConnectState = $null
+        return
+    }
+
+    $st = $script:TelnetConnectState
+    if (-not $st) {
+        try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+        return
+    }
+
+    try {
+        $elapsedMs = (New-TimeSpan -Start $st.Started -End (Get-Date)).TotalMilliseconds
+        if ($elapsedMs -gt 5000) {
+            Telnet-ConnectFail -Message ("Connection timed out to {0}:{1}" -f $st.Host, $st.Port)
+            return
+        }
+
+        if ($st.Iar -and $st.Iar.AsyncWaitHandle -and $st.Iar.AsyncWaitHandle.WaitOne(0, $false)) {
+            try { if ($script:TelnetConnectTimer) { $script:TelnetConnectTimer.Stop() } } catch { }
+try { $st.Client.EndConnect($st.Iar) } catch {
+                $msg = $_.Exception.Message
+                try {
+                    if ($_.Exception.InnerException -and $_.Exception.InnerException.Message) {
+                        $msg = $_.Exception.InnerException.Message
+                    }
+                } catch { }
+                Telnet-ConnectFail -Message $msg
+                return
+            }
+
+            if (-not $st.Client.Connected) {
+                Telnet-ConnectFail -Message ("Unable to connect to {0}:{1}" -f $st.Host, $st.Port)
+                return
+            }
+
+            $stream = $st.Client.GetStream()
+            $stream.ReadTimeout  = 1000
+            $stream.WriteTimeout = 1000
+
+            $script:TelnetClient    = $st.Client
+            $script:TelnetStream    = $stream
+            $script:TelnetConnected = $true
+
+            $script:TelnetConnectState = $null
+
+            Update-TelnetUiState -Connected $true -Connecting $false
+            Set-TelnetStatus -Text "Connected" -Brush ([System.Windows.Media.Brushes]::LimeGreen)
+
+            Append-TelnetOutput "[Connected] Auto-login...`r`n"
+
+            # Auto-login: send username now; password shortly after (if present)
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($st.Username)) {
+                    Send-WorldTelnetLine -Line $st.Username -NoEcho
+                }
+            } catch { }
+
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($st.Password)) {
+                    # one-shot timer (300ms) to send password, without echoing
+                    $pw = [string]$st.Password
+
+                    if (-not $script:TelnetLoginTimer) {
+                        $lt = New-Object System.Windows.Threading.DispatcherTimer
+                        $lt.Interval = [TimeSpan]::FromMilliseconds(300)
+                        $lt.add_Tick({
+                            try { $script:TelnetLoginTimer.Stop() } catch { }
+                            try { Send-WorldTelnetLine -Line $script:TelnetPendingPassword -NoEcho } catch { }
+                            $script:TelnetPendingPassword = $null
+                        })
+                        $script:TelnetLoginTimer = $lt
+                    }
+
+                    $script:TelnetPendingPassword = $pw
+                    $script:TelnetLoginTimer.Start()
+                }
+            } catch { }
+
+            # Start read loop (UI-thread polling)
+            Start-TelnetReadLoop
+        }
+    } catch {
+        $msg = $_.Exception.Message
+        try {
+            if ($_.Exception.InnerException -and $_.Exception.InnerException.Message) {
+                $msg = $_.Exception.InnerException.Message
+            }
+        } catch { }
+        Telnet-ConnectFail -Message $msg
+    }
+}
+
+function Connect-WorldTelnet {
+    try {
+        if ($script:TelnetConnected -or $script:TelnetConnectState) { return }
+
+        $target = Get-TelnetTargetFromUiOrConfig
+        $telnetHost = ([string]$target.Host).Trim()
+        $port = [int]$target.Port
+
+        try { $TxtTelnetTarget.Text = ("{0}:{1}" -f $telnetHost, $port) } catch { }
+
+        $creds = Get-TelnetCredentialsFromUiOrSecrets -TelnetHost $telnetHost -Port $port
+        $user  = [string]$creds.Username
+        $pw    = [string]$creds.Password
+
+        if ([string]::IsNullOrWhiteSpace($user)) {
+            Add-GuiLog "ERROR: Telnet username is not set (Configuration tab > Worldserver Telnet)."
+            Set-TelnetStatus -Text "Missing username" -Brush ([System.Windows.Media.Brushes]::Tomato)
+            return
+        }
+
+        $script:TelnetStopRequested = $false
+
+        Stop-TelnetTimers
+
+        Update-TelnetUiState -Connected $false -Connecting $true
+        Set-TelnetStatus -Text "Connecting..." -Brush ([System.Windows.Media.Brushes]::Gold)
+
+        Append-TelnetOutput (("`r`n[Connecting to {0}:{1}]`r`n") -f $telnetHost, $port)
+$client = $null
+        $iar    = $null
+        $ipObj  = $null
+
+        # Prefer the IPAddress overload when the host is an IP (avoids dual-stack/DNS ambiguity)
+        if ([System.Net.IPAddress]::TryParse($telnetHost, [ref]$ipObj)) {
+            $client = New-Object System.Net.Sockets.TcpClient($ipObj.AddressFamily)
+            $iar = $client.BeginConnect($ipObj, $port, $null, $null)
+        } else {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect($telnetHost, $port, $null, $null)
+        }
+$script:TelnetConnectState = [pscustomobject]@{
+            Client   = $client
+            Iar      = $iar
+            Started  = (Get-Date)
+            Host     = $telnetHost
+            Port     = $port
+            Username = $user
+            Password = $pw
+            TriedLocalhostRetry = $false
+        }
+
+        if (-not $script:TelnetConnectTimer) {
+            $t = New-Object System.Windows.Threading.DispatcherTimer
+            $t.Interval = [TimeSpan]::FromMilliseconds(150)
+            $t.add_Tick({ Telnet-ConnectTick })
+            $script:TelnetConnectTimer = $t
+        }
+
+        $script:TelnetConnectTimer.Start()
+    } catch {
+        Add-GuiLog ("ERROR: Telnet connect error: {0}" -f $_.Exception.Message)
+        Update-TelnetUiState -Connected $false -Connecting $false
+        Set-TelnetStatus -Text "Connect failed" -Brush ([System.Windows.Media.Brushes]::Tomato)
+    }
+}
+
+
+
+# (Telnet read loop replaced by UI-thread DispatcherTimer for PS2EXE compatibility)
+
+function Send-WorldTelnetLine {
+    param(
+        [Parameter(Mandatory)][string]$Line,
+        [switch]$NoEcho
+    )
+
+    if (-not $script:TelnetConnected -or -not $script:TelnetStream) {
+        Add-GuiLog "WARN: Telnet is not connected."
+        return
+    }
+
+    try {
+        $enc = [System.Text.Encoding]::ASCII
+        $bytes = $enc.GetBytes(($Line + "`r`n"))
+        $script:TelnetStream.Write($bytes, 0, $bytes.Length)
+        $script:TelnetStream.Flush()
+
+        # Echo locally for clarity (unless suppressed for sensitive values like passwords)
+        if (-not $NoEcho) {
+            Append-TelnetOutput ("`r`n> {0}`r`n" -f $Line)
+        }
+    } catch {
+        Add-GuiLog ("ERROR: Telnet send failed: {0}" -f $_.Exception.Message)
+        Disconnect-WorldTelnet -Silent
+    }
+}
+
+
+# Telnet tab event handlers (connect only on click; output always auto-scroll)
+Update-TelnetUiState -Connected $false -Connecting $false
+Set-TelnetStatus -Text "Disconnected" -Brush ([System.Windows.Media.Brushes]::Gold)
+Append-TelnetOutput "[Console ready] Click Connect to begin.\r\n"
+
+$BtnTelnetConnect.Add_Click({ Connect-WorldTelnet })
+$BtnTelnetDisconnect.Add_Click({ Disconnect-WorldTelnet })
+
+$BtnTelnetSend.Add_Click({
+    $cmd = ($TxtTelnetCommand.Text + "").Trim()
+    if ([string]::IsNullOrWhiteSpace($cmd)) { return }
+    $TxtTelnetCommand.Clear()
+    Send-WorldTelnetLine -Line $cmd
+})
+
+$TxtTelnetCommand.Add_KeyDown({
+    param($sender, $e)
+    try {
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter) {
+            $cmd = ($TxtTelnetCommand.Text + "").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($cmd)) {
+                $TxtTelnetCommand.Clear()
+                Send-WorldTelnetLine -Line $cmd
+            }
+            $e.Handled = $true
+        }
+    } catch { }
+})
+
+# Worldserver Log Tail (Console Tab)
+$ChkWorldLogTail.Add_Checked({
+    try { Start-WorldLogTail } catch { }
+})
+$ChkWorldLogTail.Add_Unchecked({
+    try { Stop-WorldLogTail } catch { }
+})
+
+$BtnClearWorldLog.Add_Click({
+    try { $TxtWorldLogOutput.Clear() } catch { }
+    try {
+        if ($ChkWorldLogTail -and $ChkWorldLogTail.IsChecked) {
+            Start-WorldLogTail -StartAtEnd
+        }
+    } catch { }
 })
 
 $BtnStartWatchdog.Add_Click({ Start-WatchdogPreferred })
@@ -5608,7 +7804,7 @@ $BtnLaunchSppManager.Add_Click({
         $owner = "skeezerbean"
         $repo  = "SPP-LegionV2-Management"
 
-        $installDir = $script:ToolsDir
+        $installDir = $script:ToolsDir  # Matches: SPP.LegionV2.Management.0.0.2.24.zip
         $assetRegex = '^SPP\.LegionV2\.Management\.\d+\.\d+\.\d+\.\d+\.zip$'
 
         # Confirmed extracted EXE location:
@@ -5666,6 +7862,13 @@ $timer.Add_Tick({
 
 $timer.Start()
 
+
+
+# Ensure telnet socket is closed when the window exits
+$Window.add_Closing({
+    try { Disconnect-WorldTelnet -Silent } catch { }
+    try { Stop-WorldLogTail } catch { }
+})
 
 # -------------------------------------------------
 # Show
