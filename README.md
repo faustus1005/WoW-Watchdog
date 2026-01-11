@@ -39,6 +39,7 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
 ### Updates
 - Check for and update to the latest **GitHub Release** from within the app
 - Update workflow stops the watchdog safely and maintains graceful shutdown behavior
+- Handles SPP Legion Repack update process with graceful shutdown, backup, update, and restart behaviors
 
 ### Backup & Restore
 - Database backup/restore:
