@@ -10,27 +10,58 @@ This tool runs quietly in the background, periodically checking specified server
 
 It is geared mostly towards the SPP Legion Repack, so many of the features will not work with other repacks without modification, but the core feature of starting/stopping/notifying should work for most WoW Private servers.
 
-## ✨ Features
+## Features
 
-*  **Server Status Checks**: Accurately detect if a server is online or offline.
-    
-*  **Configurable Notifications**: Receive alerts for server status changes.
+### Watchdog & Service Control
+- GUI-based watchdog for WoW server stacks (World/Auth/DB)
+- Runs as a Windows Service via **NSSM**
+- Process alias detection (e.g., `authserver` / `bnetserver`, `mysqld`/MariaDB variants)
+- Crash-loop protection with restart cooldowns
+- Reliable stop/start behavior (no unintended immediate restarts)
+- Graceful shutdown preserved when stopping via the app or Windows Services
 
-*  **Self Updater**: App can update itself from the latest release. (Current bug to be fixed in next release. Please update manually until v1.2.2)
+### Monitoring & Live Operations
+- Service status + health indicators (GUI ↔ service heartbeat)
+- Online player count (when DB is configured/reachable; safe fallback when not)
+- CPU/Memory usage snapshots (periodic refresh)
+- Worldserver console integration (RA):
+  - Connect/configure RA console
+  - View console output in-app
+  - Send commands from the launcher
 
-*  **SPP Legion Repack Update Support** Now handles SPP Legion Repack update process.
+### Notifications & Security
+- **NTFY** notifications with:
+  - Basic auth (username/password)
+  - Token auth
+  - Auth mode selector with dynamic fields
+- Sensitive values stored encrypted in `secrets.json` (auto-used on reload)
 
-*  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
+### Updates
+- Check for and update to the latest **GitHub Release** from within the app
+- Update workflow stops the watchdog safely and maintains graceful shutdown behavior
 
-*  **Database**: Backup and Restore Management
+### Backup & Restore
+- Database backup/restore:
+  - Select destination
+  - ZIP compression by default
+  - Retention policy (default 14 days)
+  - Restore from `.sql` or `.zip`
+- Full server/repack backup:
+  - Graceful stop order: **World → Auth → DB**
+  - ZIP the entire repack folder
+  - Restart order: **DB → Auth → World**
+- Option to back up only Auth/World configuration files
+- Backup destinations support **UNC paths** (e.g., `\\server\share\folder`)
 
-*  **Backups**: Create backups of the entire server/repack folder, or just auth/world config files.
+### Tools
+- Integrated tooling tab for companion utilities
+- SPP V2 Legion Management app support (managed install/launch)
+- Battle Shop Editor support (installed/managed under ProgramData)
 
-*  **Tools**: SPP V2 Management Tool and BattlePay Editor download/install/launch
-    
-*  **JSON-based Configuration**: Easy and flexible setup using a human-readable `config.json` file.
-    
-*  **Easy Use**: Designed for easy deployment and setup.
+### Deployment & Portability
+- Standard installer via **Inno Setup**
+- ProgramData-based config/logs/tools layout for consistent machine-wide storage
+- **Portable mode** supported (no installer required)
 
 ![Main](https://github.com/user-attachments/assets/013e7cb3-9dbb-48c2-a31a-94980dacde08)
 ![Conf](https://github.com/user-attachments/assets/045be4d1-a628-4623-9ba6-46896a797c72)
