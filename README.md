@@ -18,6 +18,8 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
 
 *  **Self Updater**: App can update itself from the latest release. (Current bug to be fixed in next release. Please update manually until v1.2.2)
 
+*  **SPP Legion Repack Update Support** Now handles SPP Legion Repack update process.
+
 *  **Resource and Info monitoring**: Monitor uptime, resource usage, and online player stats.
 
 *  **Database**: Backup and Restore Management
@@ -30,10 +32,11 @@ It is geared mostly towards the SPP Legion Repack, so many of the features will 
     
 *  **Easy Use**: Designed for easy deployment and setup.
 
-![Main](https://github.com/user-attachments/assets/f5f96c70-2c10-4ce2-8480-8cdd73ba2a37)
-![config](https://github.com/user-attachments/assets/e399a623-76a7-439e-9ad8-ac1d07e2be8c)
-![tools](https://github.com/user-attachments/assets/80096c32-ac6a-4e25-ae2a-c27f0162a1c6)
-![update](https://github.com/user-attachments/assets/4bed4379-6d80-4d09-b833-fc60d05ff320)
+![Main](https://github.com/user-attachments/assets/013e7cb3-9dbb-48c2-a31a-94980dacde08)
+![Conf](https://github.com/user-attachments/assets/045be4d1-a628-4623-9ba6-46896a797c72)
+![Tools](https://github.com/user-attachments/assets/1485eb82-eddc-4219-9555-3e31f8bcffdb)
+![WorldserverConsole](https://github.com/user-attachments/assets/676e162a-486b-4660-8a2b-b98fcabbd8cc)
+![Updates](https://github.com/user-attachments/assets/51757596-6baf-4370-8ff3-f93c251c0f79)
 
 ## 🛠️ Tech Stack
 
