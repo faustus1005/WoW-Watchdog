@@ -1,6 +1,2 @@
 ## ToDo List
-1. Adding a "Full Backup" option (stop all services, zip the entire repack folder)
-2. Config file only backup
-3. SPP Legion Update (Stop services, Take a full backup, run the update script, attempt to restart services)
-4. Worldserver remote console access
-5. Restructure UI - Service control buttons feel a bit cluttered, Tool tab might need to be broken out into 2 tabs. Tools and Backups?
+1. I dunno.

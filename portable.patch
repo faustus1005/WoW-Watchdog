@@ -1,0 +1,227 @@
+--- WoWWatcherGUI.ps1
++++ WoWWatcherGUI.ps1
+@@ -1,6 +1,83 @@
+ ﻿<# 
+     WoW Watchdog GUI Script
+ #>
+ 
++[CmdletBinding()]
++param(
++    # Portable mode / overrides (optional)
++    [switch]$Portable,
++    [string]$AppRootOverride,
++    [string]$DataDirOverride,
++    [string]$LogsDirOverride,
++    [string]$ToolsDirOverride,
++    [string]$ConfigPathOverride,
++    [string]$SecretsPathOverride
++)
++
++function Get-WwAppRoot {
++    param([string]$Override)
++
++    if ($Override -and (Test-Path -LiteralPath $Override)) {
++        return (Resolve-Path -LiteralPath $Override).Path
++    }
++
++    # Script execution path
++    if ($PSScriptRoot -and (Test-Path -LiteralPath $PSScriptRoot)) {
++        return (Resolve-Path -LiteralPath $PSScriptRoot).Path
++    }
++
++    if ($MyInvocation.MyCommand.Path) {
++        return (Split-Path -Parent $MyInvocation.MyCommand.Path)
++    }
++
++    # PS2EXE / EXE execution path
++    try {
++        $bd = [System.AppDomain]::CurrentDomain.BaseDirectory
++        if ($bd) {
++            return $bd.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
++        }
++    } catch { }
++
++    return (Get-Location).Path
++}
++
++function Test-WwPortable {
++    param(
++        [Parameter(Mandatory)][string]$Root,
++        [switch]$PortableSwitch
++    )
++
++    if ($PortableSwitch) { return $true }
++    if (Test-Path -LiteralPath (Join-Path $Root "portable.flag")) { return $true }
++
++    # Heuristics: if a local config exists, treat it as portable
++    if (Test-Path -LiteralPath (Join-Path $Root "data\config.json")) { return $true }
++    if (Test-Path -LiteralPath (Join-Path $Root "config.json")) { return $true }
++
++    return $false
++}
++
++function Ensure-WwDir {
++    param([Parameter(Mandatory)][string]$Path)
++    if (-not (Test-Path -LiteralPath $Path)) {
++        New-Item -ItemType Directory -Path $Path -Force | Out-Null
++    }
++}
++
++# Resolve portable vs installed mode as early as possible (before elevation)
++$script:WwAppRoot    = Get-WwAppRoot -Override $AppRootOverride
++$script:WwIsPortable = Test-WwPortable -Root $script:WwAppRoot -PortableSwitch:$Portable
++
++# Crash log path is needed even before the main UI initializes
++$script:CrashDir = if ($LogsDirOverride) {
++    $LogsDirOverride
++} elseif ($script:WwIsPortable) {
++    Join-Path $script:WwAppRoot "logs"
++} else {
++    Join-Path $env:ProgramData "WoWWatchdog"
++}
++Ensure-WwDir $script:CrashDir
++$script:CrashLogPath = Join-Path $script:CrashDir "crash.log"
++
+ # -------------------------------------------------
+ # Self-elevate to Administrator if not already
+ # -------------------------------------------------
+ function Test-IsAdmin {
+@@ -16,18 +93,28 @@
+     }
+ }
+ 
+-if (-not (Test-IsAdmin)) {
++if (-not (Test-IsAdmin) -and (-not $script:WwIsPortable)) {
+ 
+-    # Relaunch *this process*, not powershell.exe
+-    $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
++    # Relaunch elevated. Prefer restarting the script when running as .ps1, otherwise restart this EXE (PS2EXE).
++    $procExe    = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
++    $scriptPath = $MyInvocation.MyCommand.Path
+ 
+     try {
+-        Start-Process -FilePath $exePath -Verb RunAs
++        if ($scriptPath -and $scriptPath.ToLowerInvariant().EndsWith(".ps1")) {
++            $args = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $scriptPath)
++            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $args -WorkingDirectory (Split-Path -Parent $scriptPath)
++        } else {
++            Start-Process -FilePath $procExe -Verb RunAs -WorkingDirectory $script:WwAppRoot
++        }
+     } catch {
+         [System.Windows.MessageBox]::Show(
+             "WoW Watchdog requires administrative privileges.",
+             "Elevation Required",
+             'OK',
+@@ -44,7 +131,7 @@
+ trap {
+     try {
+         $msg = "Unhandled exception:`n$($_)"
+         [System.Windows.MessageBox]::Show($msg, "WoW Watchdog", 'OK', 'Error')
+-        Add-Content -Path (Join-Path $env:ProgramData "WoWWatchdog\crash.log") -Value $msg
++        Add-Content -Path $script:CrashLogPath -Value $msg
+     } catch { }
+     break
+ }
+@@ -146,31 +233,74 @@
+ # -------------------------------------------------
+ # Canonical paths and globals
+ # -------------------------------------------------
+-$AppName     = "WoWWatchdog"
+-$ExePath     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+-$InstallDir  = Split-Path -Parent $ExePath
+-$ScriptDir   = $InstallDir
+-
+-
+-$script:ScriptDir = $ScriptDir
+-$DataDir     = Join-Path $env:ProgramData $AppName
+-if (-not (Test-Path -LiteralPath $DataDir)) {
+-    New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
+-}
+-
+-# Tools downloaded/installed by launchers MUST be writable without elevation.
+-# Use ProgramData\WoWWatchdog\Tools (installer grants users-modify on the WoWWatchdog folder).
+-$script:ToolsDir = Join-Path $DataDir "Tools"
+-if (-not (Test-Path -LiteralPath $script:ToolsDir)) {
+-    New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null
+-}
+-
+-$ConfigPath     = Join-Path $DataDir "config.json"
+-$SecretsPath    = Join-Path $DataDir "secrets.json"
+-$LogPath        = Join-Path $DataDir "watchdog.log"
+-$HeartbeatFile  = Join-Path $DataDir "watchdog.heartbeat"
+-$StopSignalFile = Join-Path $DataDir "watchdog.stop"
+-
+-$ServiceName    = "WoWWatchdog"
++$AppName     = "WoWWatchdog"
++$ExePath     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
++
++# App root resolved via portable-aware bootstrap (works for .ps1 and PS2EXE)
++$InstallDir  = $script:WwAppRoot
++$ScriptDir   = $InstallDir
++
++$script:ScriptDir  = $ScriptDir
++$script:IsPortable = $script:WwIsPortable
++
++# State/config directory: installed mode remains backward-compatible (ProgramData\WoWWatchdog)
++$DataDir = if ($DataDirOverride) {
++    $DataDirOverride
++} elseif ($script:IsPortable) {
++    Join-Path $InstallDir "data"
++} else {
++    Join-Path $env:ProgramData $AppName
++}
++Ensure-WwDir $DataDir
++
++# Logs: installed mode keeps legacy location, portable uses .\logs
++$script:LogsDir = if ($LogsDirOverride) {
++    $LogsDirOverride
++} elseif ($script:IsPortable) {
++    Join-Path $InstallDir "logs"
++} else {
++    $DataDir
++}
++Ensure-WwDir $script:LogsDir
++
++# Tools downloaded/installed by launchers MUST be writable without elevation.
++$script:ToolsDir = if ($ToolsDirOverride) {
++    $ToolsDirOverride
++} elseif ($script:IsPortable) {
++    Join-Path $InstallDir "tools"
++} else {
++    Join-Path $DataDir "Tools"
++}
++Ensure-WwDir $script:ToolsDir
++
++# Prefer data\config.json for portable; migrate from legacy root files if present
++$preferredConfig  = Join-Path $DataDir "config.json"
++$legacyConfig     = Join-Path $InstallDir "config.json"
++$preferredSecrets = Join-Path $DataDir "secrets.json"
++$legacySecrets    = Join-Path $InstallDir "secrets.json"
++
++if (-not $ConfigPathOverride) {
++    if ((Test-Path -LiteralPath $legacyConfig) -and (-not (Test-Path -LiteralPath $preferredConfig))) {
++        Copy-Item -LiteralPath $legacyConfig -Destination $preferredConfig -Force
++    }
++}
++
++if (-not $SecretsPathOverride) {
++    if ((Test-Path -LiteralPath $legacySecrets) -and (-not (Test-Path -LiteralPath $preferredSecrets))) {
++        Copy-Item -LiteralPath $legacySecrets -Destination $preferredSecrets -Force
++    }
++}
++
++$ConfigPath  = if ($ConfigPathOverride) { $ConfigPathOverride } else { $preferredConfig }
++$SecretsPath = if ($SecretsPathOverride) { $SecretsPathOverride } else { $preferredSecrets }
++
++# Keep logs in the logs directory in portable mode
++$LogPath        = Join-Path $script:LogsDir "watchdog.log"
++$HeartbeatFile  = Join-Path $DataDir "watchdog.heartbeat"
++$StopSignalFile = Join-Path $DataDir "watchdog.stop"
++
++$ServiceName    = "WoWWatchdog"
++
++# Normalize working directory (Scheduled Tasks / shortcuts often default to System32)
++try { Set-Location -LiteralPath $InstallDir } catch { }
++
++# Align crash log location with resolved logs directory
++$script:CrashLogPath = Join-Path $script:LogsDir "crash.log"

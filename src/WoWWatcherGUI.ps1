@@ -1,6 +1,84 @@
-﻿<# 
+<# 
     WoW Watchdog GUI Script
 #>
+
+
+[CmdletBinding()]
+param(
+    # Portable mode / overrides (optional)
+    [switch]$Portable,
+    [string]$AppRootOverride,
+    [string]$DataDirOverride,
+    [string]$LogsDirOverride,
+    [string]$ToolsDirOverride,
+    [string]$ConfigPathOverride,
+    [string]$SecretsPathOverride
+)
+
+function Get-WwAppRoot {
+    param([string]$Override)
+
+    if ($Override -and (Test-Path -LiteralPath $Override)) {
+        return (Resolve-Path -LiteralPath $Override).Path
+    }
+
+    # Script execution path
+    if ($PSScriptRoot -and (Test-Path -LiteralPath $PSScriptRoot)) {
+        return (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    }
+
+    if ($MyInvocation.MyCommand.Path) {
+        return (Split-Path -Parent $MyInvocation.MyCommand.Path)
+    }
+
+    # PS2EXE / EXE execution path
+    try {
+        $bd = [System.AppDomain]::CurrentDomain.BaseDirectory
+        if ($bd) {
+            return $bd.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        }
+    } catch { }
+
+    return (Get-Location).Path
+}
+
+function Test-WwPortable {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [switch]$PortableSwitch
+    )
+
+    if ($PortableSwitch) { return $true }
+    if (Test-Path -LiteralPath (Join-Path $Root "portable.flag")) { return $true }
+
+    # Heuristics: if a local config exists, treat it as portable
+    if (Test-Path -LiteralPath (Join-Path $Root "data\config.json")) { return $true }
+    if (Test-Path -LiteralPath (Join-Path $Root "config.json")) { return $true }
+
+    return $false
+}
+
+function Ensure-WwDir {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+# Resolve portable vs installed mode as early as possible (before elevation)
+$script:WwAppRoot    = Get-WwAppRoot -Override $AppRootOverride
+$script:WwIsPortable = Test-WwPortable -Root $script:WwAppRoot -PortableSwitch:$Portable
+
+# Crash log path is needed even before the main UI initializes
+$script:CrashDir = if ($LogsDirOverride) {
+    $LogsDirOverride
+} elseif ($script:WwIsPortable) {
+    Join-Path $script:WwAppRoot "logs"
+} else {
+    Join-Path $env:ProgramData "WoWWatchdog"
+}
+Ensure-WwDir $script:CrashDir
+$script:CrashLogPath = Join-Path $script:CrashDir "crash.log"
 
 # -------------------------------------------------
 # Self-elevate to Administrator if not already
@@ -17,13 +95,19 @@ function Test-IsAdmin {
     }
 }
 
-if (-not (Test-IsAdmin)) {
+if (-not (Test-IsAdmin) -and (-not $script:WwIsPortable)) {
 
-    # Relaunch *this process*, not powershell.exe
-    $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # Relaunch elevated. Prefer restarting the script when running as .ps1, otherwise restart this EXE (PS2EXE).
+    $procExe    = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $scriptPath = $MyInvocation.MyCommand.Path
 
     try {
-        Start-Process -FilePath $exePath -Verb RunAs
+        if ($scriptPath -and $scriptPath.ToLowerInvariant().EndsWith(".ps1")) {
+            $args = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $scriptPath)
+            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $args -WorkingDirectory (Split-Path -Parent $scriptPath)
+        } else {
+            Start-Process -FilePath $procExe -Verb RunAs -WorkingDirectory $script:WwAppRoot
+        }
     } catch {
         [System.Windows.MessageBox]::Show(
             "WoW Watchdog requires administrative privileges.",
@@ -42,7 +126,7 @@ trap {
     try {
         $msg = "Unhandled exception:`n$($_)"
         [System.Windows.MessageBox]::Show($msg, "WoW Watchdog", 'OK', 'Error')
-        Add-Content -Path (Join-Path $env:ProgramData "WoWWatchdog\crash.log") -Value $msg
+        Add-Content -Path $script:CrashLogPath -Value $msg
     } catch { }
     break
 }
@@ -99,31 +183,76 @@ $RepoName   = "WoW-Watchdog"
 # -------------------------------------------------
 $AppName     = "WoWWatchdog"
 $ExePath     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$InstallDir  = Split-Path -Parent $ExePath
+
+# App root resolved via portable-aware bootstrap (works for .ps1 and PS2EXE)
+$InstallDir  = $script:WwAppRoot
 $ScriptDir   = $InstallDir
 
+$script:ScriptDir  = $ScriptDir
+$script:IsPortable = $script:WwIsPortable
 
-$script:ScriptDir = $ScriptDir
-$DataDir     = Join-Path $env:ProgramData $AppName
-if (-not (Test-Path -LiteralPath $DataDir)) {
-    New-Item -Path $DataDir -ItemType Directory -Force | Out-Null
+# State/config directory: installed mode remains backward-compatible (ProgramData\WoWWatchdog)
+$DataDir = if ($DataDirOverride) {
+    $DataDirOverride
+} elseif ($script:IsPortable) {
+    Join-Path $InstallDir "data"
+} else {
+    Join-Path $env:ProgramData $AppName
 }
+Ensure-WwDir $DataDir
+
+# Logs: installed mode keeps legacy location, portable uses .\logs
+$script:LogsDir = if ($LogsDirOverride) {
+    $LogsDirOverride
+} elseif ($script:IsPortable) {
+    Join-Path $InstallDir "logs"
+} else {
+    $DataDir
+}
+Ensure-WwDir $script:LogsDir
 
 # Tools downloaded/installed by launchers MUST be writable without elevation.
-# Use ProgramData\WoWWatchdog\Tools (installer grants users-modify on the WoWWatchdog folder).
-$script:ToolsDir = Join-Path $DataDir "Tools"
-if (-not (Test-Path -LiteralPath $script:ToolsDir)) {
-    New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null
+$script:ToolsDir = if ($ToolsDirOverride) {
+    $ToolsDirOverride
+} elseif ($script:IsPortable) {
+    Join-Path $InstallDir "tools"
+} else {
+    Join-Path $DataDir "Tools"
+}
+Ensure-WwDir $script:ToolsDir
+
+# Prefer data\config.json for portable; migrate from legacy root files if present
+$preferredConfig  = Join-Path $DataDir "config.json"
+$legacyConfig     = Join-Path $InstallDir "config.json"
+$preferredSecrets = Join-Path $DataDir "secrets.json"
+$legacySecrets    = Join-Path $InstallDir "secrets.json"
+
+if (-not $ConfigPathOverride) {
+    if ((Test-Path -LiteralPath $legacyConfig) -and (-not (Test-Path -LiteralPath $preferredConfig))) {
+        Copy-Item -LiteralPath $legacyConfig -Destination $preferredConfig -Force
+    }
+}
+if (-not $SecretsPathOverride) {
+    if ((Test-Path -LiteralPath $legacySecrets) -and (-not (Test-Path -LiteralPath $preferredSecrets))) {
+        Copy-Item -LiteralPath $legacySecrets -Destination $preferredSecrets -Force
+    }
 }
 
-$ConfigPath     = Join-Path $DataDir "config.json"
-$SecretsPath    = Join-Path $DataDir "secrets.json"
-$LogPath        = Join-Path $DataDir "watchdog.log"
+$ConfigPath  = if ($ConfigPathOverride) { $ConfigPathOverride } else { $preferredConfig }
+$SecretsPath = if ($SecretsPathOverride) { $SecretsPathOverride } else { $preferredSecrets }
+
+# Keep logs in the logs directory in portable mode
+$LogPath        = Join-Path $script:LogsDir "watchdog.log"
 $HeartbeatFile  = Join-Path $DataDir "watchdog.heartbeat"
 $StopSignalFile = Join-Path $DataDir "watchdog.stop"
 
 $ServiceName    = "WoWWatchdog"
 
+# Normalize working directory (Scheduled Tasks / shortcuts often default to System32)
+try { Set-Location -LiteralPath $InstallDir } catch { }
+
+# Align crash log location with resolved logs directory
+$script:CrashLogPath = Join-Path $script:LogsDir "crash.log"
 # Status flags for LED + NTFY baseline
 $global:MySqlUp       = $false
 $global:AuthUp        = $false
@@ -1083,7 +1212,32 @@ function Run-InstallerAndWait {
     return $true
 }
 
+function Read-UncPathFromUser {
+    param(
+        [string]$Prompt = "Enter a UNC path (example: \\server\share\folder):",
+        [string]$DefaultValue = ""
+    )
 
+    try { Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction SilentlyContinue | Out-Null } catch { }
+
+    $p = [Microsoft.VisualBasic.Interaction]::InputBox($Prompt, "UNC Path", ($DefaultValue + ""))
+    $p = ($p + "").Trim()
+
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+
+    # Basic UNC validation: \\server\share or deeper
+    if ($p -notmatch '^[\\]{2}[^\\]+\\[^\\]+') {
+        [System.Windows.MessageBox]::Show(
+            "That does not look like a valid UNC path.`r`nExample: \\server\share\folder",
+            "Invalid UNC Path",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Warning
+        ) | Out-Null
+        return $null
+    }
+
+    return $p
+}
 
 # -------------------------------------------------
 # XAML – Dark/Blue Theme
@@ -2872,7 +3026,7 @@ $xaml = @"
             <TextBlock Grid.Row="0"
                        TextWrapping="Wrap"
                        Foreground="#FF86B5E5">
-Stops World/Auth/MySQL, creates a full repack backup, runs the SPP V2 updater (wget + 7za + Website\Update.bat), then restarts services (MySQL -> Auth -> World).
+Stops World/Auth/MySQL, creates a full repack backup, runs the SPP V2 updater (wget + 7za + Website\Update.bat), then restarts services (MySQL -> Auth -> World). Long process, plan accordingly for down time.
             </TextBlock>
 
             <StackPanel Grid.Row="1"
@@ -3508,28 +3662,42 @@ function Persist-BackupFolderSettings {
     }
 }
 
-
 # -------- Browse: Backup folder --------
 $BtnBrowseDbBackupFolder.Add_Click({
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue | Out-Null
+
+        $current = ($TxtDbBackupFolder.Text + "").Trim()
+
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = "Select a folder for DB backups"
-        if (Test-Path $TxtDbBackupFolder.Text) { $dlg.SelectedPath = $TxtDbBackupFolder.Text }
+        $dlg.Description = "Select a folder for DB backups (UNC paths supported, e.g. \\server\share\folder)"
+        $dlg.ShowNewFolderButton = $true
+
+        # Prefer selecting an existing local path; UNC selection may be flaky in elevated context.
+        if (-not [string]::IsNullOrWhiteSpace($current) -and (Test-Path -LiteralPath $current -ErrorAction SilentlyContinue)) {
+            $dlg.SelectedPath = $current
+        }
 
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $TxtDbBackupFolder.Text = $dlg.SelectedPath
             Persist-BackupFolderSettings
+            return
         }
+
+        # User cancelled folder picker: offer UNC entry fallback
+        $unc = Read-UncPathFromUser -DefaultValue $current
+        if ($unc) {
+            $TxtDbBackupFolder.Text = $unc
+            Persist-BackupFolderSettings
+            Add-GuiLog "DB backup folder set to UNC path: $unc"
+        }
+
     } catch {
         Add-GuiLog "Backup folder browse failed: $($_.Exception.Message)"
     }
 })
 
-
-
 # -------- Browse: Repack root folder --------
-
 # Persist backup folder changes even if the user does not click "Save Configuration"
 try {
     $TxtDbBackupFolder.Add_LostFocus({
@@ -4743,6 +4911,7 @@ $BtnRunFullBackup.Add_Click({
                     RestartOk=$false
                     RestartError=$restartErr
                     Error=$err
+                    VerboseLogPath = $verboseLogPath
                     Steps=$log.ToArray()
                 }
             }
@@ -5306,6 +5475,9 @@ function Start-SppV2RepackUpdate {
         }
 
         Set-SppV2UpdateUiState -IsBusy $true -StatusText "Starting SPP V2 repack update…"
+        
+        # TESTING ONLY: disable backup while validating update flow
+        $skipBackup = $false
 
         $state = [pscustomobject]@{
             DataDir       = $DataDir
@@ -5315,9 +5487,13 @@ function Start-SppV2RepackUpdate {
             AuthExe       = [string]$Config.Authserver
             WorldExe      = [string]$Config.Worldserver
             MySqlCmd      = [string]$Config.MySQL
+            SkipBackup    = [bool]$skipBackup
 
             UpdateUrl     = "http://mdicsdildoemporium.com/dicpics/legion_update//Update.tmp"
             UpdatePass    = "https://spp-forum.de/games/document.txt"
+            SuppressMissingMySqlPopup = $true
+            UpdateBatTimeoutSec       = 1800
+            UpdateBatHeartbeatSec     = 10
         }
 
         $rs = [runspacefactory]::CreateRunspace()
@@ -5332,8 +5508,21 @@ function Start-SppV2RepackUpdate {
             param($state)
 
             $log = New-Object System.Collections.Generic.List[string]
-            function Add-Step([string]$m) { $log.Add(("{0} - {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m)) }
 
+            # Persistent per-run verbose log file (so you can watch progress live)
+            $updateLogDir = Join-Path $state.DataDir "update-logs"
+            if (-not (Test-Path -LiteralPath $updateLogDir)) {
+                try { New-Item -ItemType Directory -Path $updateLogDir -Force | Out-Null } catch { }
+            }
+            $verboseLogPath = Join-Path $updateLogDir ("spp_update_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+            function Add-Step([string]$m) {
+                $line = ("{0} - {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m)
+                $log.Add($line)
+                try { Add-Content -LiteralPath $verboseLogPath -Value $line -Encoding UTF8 } catch { }
+            }
+
+            Add-Step ("Verbose log: " + $verboseLogPath)
             function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
 
             function Send-Command([string]$name) {
@@ -5357,7 +5546,7 @@ function Start-SppV2RepackUpdate {
             if ($a -and -not ($aliases["Authserver"] -contains $a)) { $aliases["Authserver"] += $a }
             if ($w -and -not ($aliases["Worldserver"] -contains $w)) { $aliases["Worldserver"] += $w }
 
-            $holdDir = Join-Path $state.DataDir "hold"
+            $holdDir = Join-Path $state.DataDir "holds"
             Ensure-Dir $holdDir
 
             function Set-Hold([string]$role, [bool]$held) {
@@ -5401,7 +5590,51 @@ function Start-SppV2RepackUpdate {
                 return $false
             }
 
-            function Start-RoleDirect([string]$role) {
+                        function Resolve-RoleExe([string]$role, [string]$exe) {
+                $exe = ($exe + "").Trim().Trim('"')
+                if ([string]::IsNullOrWhiteSpace($exe)) { return $null }
+
+                try { $exe = [Environment]::ExpandEnvironmentVariables($exe) } catch { }
+
+                # If a directory was supplied, try common server binaries.
+                if (Test-Path -LiteralPath $exe -PathType Container) {
+                    if ($role -eq "MySQL") {
+                        foreach ($cand in @("mysqld.exe","mariadbd.exe")) {
+                            $p = Join-Path $exe $cand
+                            if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+                        }
+                    }
+                    return $null
+                }
+
+                # If role is MySQL and config points to mysql.exe (client), derive mysqld.exe from the same folder.
+                if ($role -eq "MySQL") {
+                    try {
+                        $leaf = [System.IO.Path]::GetFileName($exe)
+                        if ($leaf -and $leaf.Equals("mysql.exe", [StringComparison]::OrdinalIgnoreCase)) {
+                            $dir = Split-Path -Parent $exe
+                            foreach ($cand in @("mysqld.exe","mariadbd.exe")) {
+                                $p = Join-Path $dir $cand
+                                if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+                            }
+                        }
+                    } catch { }
+                }
+
+                if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+
+                # If no extension, try .exe to avoid ShellExecute popups (e.g., "Windows cannot find ...\mysqld").
+                try {
+                    if ([string]::IsNullOrWhiteSpace([System.IO.Path]::GetExtension($exe))) {
+                        $exe2 = $exe + ".exe"
+                        if (Test-Path -LiteralPath $exe2 -PathType Leaf) { return $exe2 }
+                    }
+                } catch { }
+
+                return $null
+            }
+
+function Start-RoleDirect([string]$role) {
                 $exe = $null
                 switch ($role) {
                     "MySQL"       { $exe = $state.MySqlCmd }
@@ -5409,11 +5642,19 @@ function Start-SppV2RepackUpdate {
                     "Worldserver" { $exe = $state.WorldExe }
                 }
 
-                if ([string]::IsNullOrWhiteSpace($exe)) { Add-Step "WARN: $role direct-start skipped (path not set)."; return $false }
-                if (-not (Test-Path -LiteralPath $exe)) { Add-Step "WARN: $role direct-start skipped (not found: $exe)."; return $false }
+                if ([string]::IsNullOrWhiteSpace($exe)) {
+                    Add-Step "WARN: $role direct-start skipped (path not set)."
+                    return $false
+                }
+
+                $resolved = Resolve-RoleExe $role $exe
+                if (-not $resolved) {
+                    Add-Step "WARN: $role direct-start skipped (not found: $exe)."
+                    return $false
+                }
 
                 try {
-                    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) | Out-Null
+                    Start-Process -FilePath $resolved -WorkingDirectory (Split-Path -Parent $resolved) -WindowStyle Hidden | Out-Null
                     Add-Step "$role direct-start invoked."
                     return $true
                 } catch {
@@ -5421,6 +5662,8 @@ function Start-SppV2RepackUpdate {
                     return $false
                 }
             }
+
+
 
             function Restart-Role([string]$role, [string]$cmdName, [int]$timeoutSec) {
                 Set-Hold $role $false
@@ -5466,16 +5709,23 @@ function Start-SppV2RepackUpdate {
                 if (-not (Wait-RoleDown "MySQL" 180)) { throw "MySQL did not stop within 180s." }
 
                 # Full repack backup
-                $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-                $safeName = ($state.ServerName + "").Trim()
-                if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "Repack" }
-                $safeName = ($safeName -replace '[^\w\-]+','_')
-                $zipPath = Join-Path $state.BackupDir ("{0}_SPPUpdateBackup_{1}.zip" -f $safeName, $stamp)
+                if (-not $state.SkipBackup) {
+                    # Full repack backup
+                    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                    $safeName = ($state.ServerName + "").Trim()
+                    if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "Repack" }
+                    $safeName = ($safeName -replace '[^\w\-]+','_')
+                    $zipPath = Join-Path $state.BackupDir ("{0}_SPPUpdateBackup_{1}.zip" -f $safeName, $stamp)
 
-                Add-Step "Creating backup zip: $zipPath"
-                if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
-                [System.IO.Compression.ZipFile]::CreateFromDirectory($state.SourceDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
-                Add-Step "Backup created: $zipPath"
+                    Add-Step "Creating backup zip: $zipPath"
+                    if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
+                    [System.IO.Compression.ZipFile]::CreateFromDirectory($state.SourceDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                    Add-Step "Backup created: $zipPath"
+                }
+                else {
+                    $zipPath = $null
+                    Add-Step "Backup skipped (testing mode)."
+                }
 
                 # Run updater commands in repack folder
                 Add-Step "Running SPP V2 updater in: $($state.SourceDir)"
@@ -5506,15 +5756,177 @@ function Start-SppV2RepackUpdate {
 
                     Start-Sleep -Seconds 1
 
-                    $bat = Join-Path $state.SourceDir "Website\Update.bat"
-                    if (Test-Path -LiteralPath $bat) {
-                        Add-Step "Running Website\Update.bat"
-                        $p = Start-Process -FilePath "cmd.exe" -ArgumentList ("/c `"" + $bat + "`"") -WorkingDirectory (Split-Path -Parent $bat) -Wait -PassThru -WindowStyle Hidden
-                        Add-Step ("Website\Update.bat exit code: " + $p.ExitCode)
-                        if ($p.ExitCode -ne 0) { throw ("Website\Update.bat failed (exit code " + $p.ExitCode + ").") }
-                    } else {
-                        Add-Step "WARN: Website\Update.bat not found, skipping."
-                    }
+                        $bat = Join-Path $state.SourceDir "Website\Update.bat"
+    if (Test-Path -LiteralPath $bat) {
+        Add-Step "Running Website\Update.bat (capturing stdout/stderr; popup suppression; timeout + heartbeat)"
+
+        $wd = (Split-Path -Parent $bat)
+
+        $stamp2 = Get-Date -Format "yyyyMMdd_HHmmss"
+        $outFile = Join-Path $updateLogDir ("update_bat_stdout_{0}.log" -f $stamp2)
+        $errFile = Join-Path $updateLogDir ("update_bat_stderr_{0}.log" -f $stamp2)
+        $inFile  = Join-Path $updateLogDir ("update_bat_stdin_{0}.txt" -f $stamp2)
+
+        # Empty stdin file prevents common "pause"/prompt hangs (similar to: <nul)
+        try { Set-Content -LiteralPath $inFile -Value "" -Encoding ASCII -Force } catch { }
+
+        $timeoutSec = 0
+        try { $timeoutSec = [int]$state.UpdateBatTimeoutSec } catch { $timeoutSec = 0 }
+        if ($timeoutSec -lt 30) { $timeoutSec = 1800 } # 30 minutes default
+
+        $heartbeatSec = 10
+        try {
+            if ($state.PSObject.Properties.Match("UpdateBatHeartbeatSec").Count -gt 0) {
+                $heartbeatSec = [int]$state.UpdateBatHeartbeatSec
+            }
+        } catch { }
+        if ($heartbeatSec -lt 2) { $heartbeatSec = 10 }
+
+        Add-Step ("Starting Update.bat with timeout {0}s; heartbeat {1}s; stdout: {2}; stderr: {3}" -f $timeoutSec, $heartbeatSec, $outFile, $errFile)
+
+        # ----------------------------
+        # Popup suppressor (best-effort)
+        # ----------------------------
+        $dlg = $null
+        try {
+            if ($state.PSObject.Properties.Match("SuppressMissingMySqlPopup").Count -gt 0 -and [bool]$state.SuppressMissingMySqlPopup) {
+                Add-Type -Namespace Win32 -Name User32 -MemberDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class User32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+}
+"@ -ErrorAction SilentlyContinue | Out-Null
+
+                $stop = $false
+                $rx = New-Object System.Text.RegularExpressions.Regex('(?i)(windows cannot find|\\(mysql|mysqld|mariadbd)(\.exe)?$|mysql\.exe|mysqld\.exe|mariadbd\.exe)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+                $dlg = [System.Threading.Thread]{
+                    try {
+                        while (-not $stop) {
+                            [Win32.User32]::EnumWindows({ param($h,$lp)
+                                try {
+                                    if (-not [Win32.User32]::IsWindowVisible($h)) { return $true }
+                                    $sbC = New-Object System.Text.StringBuilder 256
+                                    [void][Win32.User32]::GetClassName($h, $sbC, $sbC.Capacity)
+                                    if ($sbC.ToString() -ne "#32770") { return $true } # dialog class
+
+                                    $len = [Win32.User32]::GetWindowTextLength($h)
+                                    if ($len -le 0) { return $true }
+                                    $sbT = New-Object System.Text.StringBuilder ($len + 1)
+                                    [void][Win32.User32]::GetWindowText($h, $sbT, $sbT.Capacity)
+                                    $title = $sbT.ToString()
+
+                                    if ($title -and $rx.IsMatch($title)) {
+                                        # WM_CLOSE = 0x0010
+                                        [void][Win32.User32]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+                                    }
+                                } catch { }
+                                return $true
+                            }, [IntPtr]::Zero) | Out-Null
+
+                            Start-Sleep -Milliseconds 250
+                        }
+                    } catch { }
+                }
+                $dlg.IsBackground = $true
+                $dlg.Start()
+                Add-Step "Popup suppressor started (closing Windows 'cannot find' + mysql/mysqld/mariadbd dialogs)."
+            }
+        } catch {
+            Add-Step ("WARN: Popup suppressor failed to start: " + $_.Exception.Message)
+        }
+
+        try {
+            $p = Start-Process -FilePath "cmd.exe" `
+                -ArgumentList @("/d","/c", "call", "`"$bat`"") `
+                -WorkingDirectory $wd `
+                -WindowStyle Hidden `
+                -PassThru `
+                -RedirectStandardOutput $outFile `
+                -RedirectStandardError  $errFile `
+                -RedirectStandardInput  $inFile
+
+            $swBat = [diagnostics.stopwatch]::StartNew()
+            $nextBeat = 0
+
+            while (-not $p.HasExited) {
+                Start-Sleep -Milliseconds 250
+
+                $elapsed = [int]$swBat.Elapsed.TotalSeconds
+                if ($elapsed -ge $timeoutSec) {
+                    Add-Step ("ERROR: Website\Update.bat timed out after {0}s; killing process tree." -f $timeoutSec)
+
+                    try { $p.Kill() } catch { }
+
+                    # Kill child process tree (best-effort)
+                    try {
+                        $toKill = New-Object System.Collections.Generic.List[int]
+                        $toKill.Add($p.Id) | Out-Null
+
+                        $added = $true
+                        while ($added) {
+                            $added = $false
+                            $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($toKill[-1])" -ErrorAction SilentlyContinue
+                            foreach ($c in $children) {
+                                if ($c -and $c.ProcessId -and -not $toKill.Contains([int]$c.ProcessId)) {
+                                    $toKill.Add([int]$c.ProcessId) | Out-Null
+                                    $added = $true
+                                }
+                            }
+                        }
+
+                        foreach ($pid in ($toKill | Sort-Object -Descending)) {
+                            try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch { }
+                        }
+                    } catch { }
+
+                    throw ("Website\Update.bat timed out after " + $timeoutSec + " seconds.")
+                }
+
+                if ($elapsed -ge $nextBeat) {
+                    $nextBeat = $elapsed + $heartbeatSec
+
+                    $outBytes = 0
+                    $errBytes = 0
+                    try { $outBytes = (Get-Item -LiteralPath $outFile -ErrorAction Stop).Length } catch { }
+                    try { $errBytes = (Get-Item -LiteralPath $errFile -ErrorAction Stop).Length } catch { }
+
+                    Add-Step ("Update.bat still running (elapsed {0}s). stdout={1:N0} bytes; stderr={2:N0} bytes." -f $elapsed, $outBytes, $errBytes)
+                }
+            }
+
+            Add-Step ("Update.bat finished after {0}s." -f ([int]$swBat.Elapsed.TotalSeconds))
+            Add-Step ("Website\Update.bat exit code: " + $p.ExitCode)
+
+            # If it failed, echo the tail of stdout/stderr into steps for quick triage
+            if ($p.ExitCode -ne 0) {
+                Add-Step "---- Update.bat STDOUT tail ----"
+                try { Get-Content -LiteralPath $outFile -ErrorAction Stop -Tail 200 | ForEach-Object { Add-Step ("stdout: " + $_) } } catch { Add-Step "stdout: <unavailable>" }
+                Add-Step "---- Update.bat STDERR tail ----"
+                try { Get-Content -LiteralPath $errFile -ErrorAction Stop -Tail 200 | ForEach-Object { Add-Step ("stderr: " + $_) } } catch { Add-Step "stderr: <unavailable>" }
+
+                throw ("Website\Update.bat failed (exit code " + $p.ExitCode + ").")
+            }
+        }
+        finally {
+            try { $stop = $true } catch { }
+            try { if ($dlg -and $dlg.IsAlive) { $dlg.Join(1000) | Out-Null } } catch { }
+            Add-Step "Popup suppressor stopped."
+        }
+    } else {
+        Add-Step "WARN: Website\Update.bat not found, skipping."
+    }
+
 
                     Start-Sleep -Seconds 1
                     Add-Step "Updater phase completed."

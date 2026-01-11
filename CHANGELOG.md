@@ -87,3 +87,13 @@ Bug fixes:
 - Live Log now is only shown on Main tab, to allow for more space in the other tabs.
 - Several small bug fixes (hopefully including the auto update process!)
 - UI reconfiguration on Main tab. Buttons laid out in a more easy to read fashion, restart buttons added to each service.
+
+## v1.2.3 – Feature Release
+- SPP Legion Repack Update Support
+  - Using the same commands as the provided script, the launcher now supports running the repack update from the launcher.
+    - Update stops all services gracefully.
+	- Performs a full repack backup to your selected backup destination in the Tools tab.
+	- Runs SPP update
+	- Restarts services in correct order.
+- Backup folder now supports UNC paths (Hit cancel without selecting a folder, or simply enter into the box)
+- Portable is now supported. I will offer packages in the release for portable.
