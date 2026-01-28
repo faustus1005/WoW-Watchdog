@@ -6,7 +6,9 @@ param(
     [int]$MaxRestarts      = 100,  # max restarts within burst window
     [int]$ConfigRetrySec   = 10,   # if config invalid/missing, re-check every N seconds
     [int]$HeartbeatEverySec = 1,    # heartbeat update cadence
-    [int]$ShutdownDelaySec = 8  # delay between service stops
+    [int]$ShutdownDelaySec = 8,  # delay between service stops
+    [int64]$LogMaxBytes    = 5242880, # 5 MB
+    [int]$LogRetainCount   = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,9 +69,36 @@ $global:LastConfigLoadState = ""   # "MissingConfig", "InvalidConfig", or ""
 # -------------------------------
 # Logging (never throw)
 # -------------------------------
+function Rotate-LogIfNeeded {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int64]$MaxBytes = 5242880,
+        [int]$Keep = 5
+    )
+
+    try {
+        if (-not (Test-Path $Path)) { return }
+        if ($MaxBytes -le 0 -or $Keep -le 0) { return }
+
+        $len = (Get-Item -LiteralPath $Path).Length
+        if ($len -lt $MaxBytes) { return }
+
+        for ($i = $Keep - 1; $i -ge 1; $i--) {
+            $src = "$Path.$i"
+            $dst = "$Path." + ($i + 1)
+            if (Test-Path $src) {
+                Move-Item -LiteralPath $src -Destination $dst -Force
+            }
+        }
+
+        Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+    } catch { }
+}
+
 function Log {
     param([string]$Message)
     try {
+        Rotate-LogIfNeeded -Path $LogFile -MaxBytes $LogMaxBytes -Keep $LogRetainCount
         $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         Add-Content -Path $LogFile -Value "[$ts] $Message" -Encoding UTF8
     } catch { }
@@ -145,18 +174,83 @@ $WorldBurstStart   = $null
 # -------------------------------
 # Config loading + validation
 # -------------------------------
+$DefaultConfig = [ordered]@{
+    ServerName  = ""
+    Expansion   = "Unknown"
+    MySQL       = ""
+    Authserver  = ""
+    Worldserver = ""
+    NTFY = [ordered]@{
+        Server           = ""
+        Topic            = ""
+        Tags             = "wow,watchdog"
+        PriorityDefault  = 4
+        EnableMySQL      = $true
+        EnableAuthserver = $true
+        EnableWorldserver= $true
+        SendOnDown       = $true
+        SendOnUp         = $false
+    }
+}
+
+function Write-ConfigFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Object
+    )
+
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        }
+        $Object | ConvertTo-Json -Depth 10 | Set-Content -Path $Path -Encoding UTF8
+    } catch {
+        Log "ERROR: Failed to write config to $Path. Error: $($_)"
+    }
+}
+
+function Ensure-ConfigSchema {
+    param(
+        [Parameter(Mandatory)]$Cfg,
+        [Parameter(Mandatory)]$Defaults
+    )
+
+    $changed = $false
+    foreach ($p in $Defaults.PSObject.Properties) {
+        if (-not $Cfg.PSObject.Properties[$p.Name]) {
+            $Cfg | Add-Member -MemberType NoteProperty -Name $p.Name -Value $p.Value
+            $changed = $true
+            continue
+        }
+
+        if ($p.Value -is [psobject] -and $Cfg.$($p.Name) -is [psobject]) {
+            $nestedChanged = Ensure-ConfigSchema -Cfg $Cfg.$($p.Name) -Defaults $p.Value
+            if ($nestedChanged) { $changed = $true }
+        }
+    }
+
+    return $changed
+}
+
 function Load-ConfigSafe {
     if (-not (Test-Path $ConfigPath)) {
         if ($global:LastConfigLoadState -ne "MissingConfig") {
             Log "config.json missing at $ConfigPath. Watchdog idle (will retry)."
             $global:LastConfigLoadState = "MissingConfig"
         }
+        Write-ConfigFile -Path $ConfigPath -Object $DefaultConfig
         Write-Heartbeat -State "Idle" -Extra @{ reason = "MissingConfig"; configPath = $ConfigPath }
         return $null
     }
 
     try {
         $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+        if ($cfg) {
+            if (Ensure-ConfigSchema -Cfg $cfg -Defaults $DefaultConfig) {
+                Write-ConfigFile -Path $ConfigPath -Object $cfg
+            }
+        }
         $global:LastConfigLoadState = ""
         return $cfg
     }

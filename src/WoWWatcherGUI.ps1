@@ -245,6 +245,8 @@ $SecretsPath = if ($SecretsPathOverride) { $SecretsPathOverride } else { $prefer
 $LogPath        = Join-Path $script:LogsDir "watchdog.log"
 $HeartbeatFile  = Join-Path $DataDir "watchdog.heartbeat"
 $StopSignalFile = Join-Path $DataDir "watchdog.stop"
+$LogMaxBytes    = 5242880
+$LogRetainCount = 5
 
 $ServiceName    = "WoWWatchdog"
 
@@ -6600,11 +6602,38 @@ function Get-NtfyAuthHeaders {
 # -------------------------------------------------
 # GUI log helper
 # -------------------------------------------------
+function Rotate-GuiLogIfNeeded {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int64]$MaxBytes = 5242880,
+        [int]$Keep = 5
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        if ($MaxBytes -le 0 -or $Keep -le 0) { return }
+
+        $len = (Get-Item -LiteralPath $Path).Length
+        if ($len -lt $MaxBytes) { return }
+
+        for ($i = $Keep - 1; $i -ge 1; $i--) {
+            $src = "$Path.$i"
+            $dst = "$Path." + ($i + 1)
+            if (Test-Path -LiteralPath $src) {
+                Move-Item -LiteralPath $src -Destination $dst -Force
+            }
+        }
+
+        Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+    } catch { }
+}
+
 function Add-GuiLog {
     param([string]$Message)
 
     try {
         $tsFile = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Rotate-GuiLogIfNeeded -Path $LogPath -MaxBytes $LogMaxBytes -Keep $LogRetainCount
         Add-Content -Path $LogPath -Value "[$tsFile] $Message" -Encoding UTF8
     } catch { }
 
