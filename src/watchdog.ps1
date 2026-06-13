@@ -664,6 +664,70 @@ function Stop-MySQLGracefully {
 # -------------------------------
 # Stop a service/role.
 # -------------------------------
+function Stop-RoleProcesses {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("MySQL","Authserver","Worldserver")]
+        [string]$Role,
+
+        [string]$ExpectedPath
+    )
+
+    # When the configured path is a concrete .exe, stop only the process(es) whose
+    # image path matches it, so a stop never reaches a same-named process from a
+    # different installation. This mirrors Test-ProcessRoleRunning: a process whose
+    # path cannot be read is treated as ours only when no same-named process is
+    # demonstrably from another install, so we neither orphan our own instance nor
+    # kill someone else's.
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPath) -and $ExpectedPath -match '\.exe$') {
+        $expectedFull = $ExpectedPath
+        try { $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath) } catch { }
+        $expectedName = [System.IO.Path]::GetFileNameWithoutExtension($ExpectedPath)
+
+        $procs = @()
+        try { $procs = @(Get-Process -Name $expectedName -ErrorAction SilentlyContinue) } catch { $procs = @() }
+        if (@($procs).Count -eq 0) { return }
+
+        $toStop              = New-Object System.Collections.Generic.List[object]
+        $unverifiable        = New-Object System.Collections.Generic.List[object]
+        $sawReadableMismatch = $false
+
+        foreach ($proc in $procs) {
+            $procPath = $null
+            try {
+                $procPath = $proc.Path
+                if (-not $procPath) { $procPath = $proc.MainModule.FileName }
+            } catch { $procPath = $null }
+
+            if (-not $procPath) { $unverifiable.Add($proc) | Out-Null; continue }
+
+            try { $procPath = [System.IO.Path]::GetFullPath($procPath) } catch { }
+            if ($procPath -ieq $expectedFull) { $toStop.Add($proc) | Out-Null }
+            else { $sawReadableMismatch = $true }
+        }
+
+        # Only stop unverifiable-path processes when none were demonstrably from
+        # another install (same rule the detector uses to claim the role as ours).
+        if (-not $sawReadableMismatch) {
+            foreach ($p in $unverifiable) { $toStop.Add($p) | Out-Null }
+        }
+
+        foreach ($p in $toStop) {
+            try { $p | Stop-Process -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        return
+    }
+
+    # No resolvable executable (e.g. a .bat launcher, or no config supplied): fall
+    # back to stopping by process-name aliases to handle renamed binaries.
+    foreach ($p in $ProcessAliases[$Role]) {
+        try {
+            Get-Process -Name $p -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
+}
+
 function Stop-Role {
     param(
         [Parameter(Mandatory)]
@@ -683,14 +747,21 @@ function Stop-Role {
         }
     }
 
-    # Stop by process name aliases to handle renamed binaries.
-    foreach ($p in $ProcessAliases[$Role]) {
+    # Resolve the configured executable so we only stop the instance this watchdog
+    # manages, not same-named processes belonging to a different install. A .bat
+    # launcher (common for MySQL) has no exe path, so that case falls back to the
+    # alias-based stop inside Stop-RoleProcesses.
+    $expectedPath = $null
+    if ($Cfg) {
         try {
-            Get-Process -Name $p -ErrorAction SilentlyContinue |
-                Stop-Process -Force -ErrorAction SilentlyContinue
+            $cfgPath = [string]$Cfg.$Role
+            if (-not [string]::IsNullOrWhiteSpace($cfgPath) -and $cfgPath -match '\.exe$') {
+                $expectedPath = $cfgPath
+            }
         } catch { }
     }
 
+    Stop-RoleProcesses -Role $Role -ExpectedPath $expectedPath
     Log "$Role stop requested."
 }
 
@@ -707,13 +778,13 @@ function Stop-All-Gracefully {
     Log "Graceful shutdown initiated."
 
     # Stop in reverse dependency order: World -> Auth -> DB.
-    Stop-Role -Role "Worldserver"
+    Stop-Role -Role "Worldserver" -Cfg $Cfg
     if (-not (Wait-ForRoleDown -Role "Worldserver" -ExpectedPath ([string]$Cfg.Worldserver) -TimeoutSec $WaitTimeoutSec)) {
         Log "Graceful shutdown wait timed out for Worldserver."
     }
     Start-Sleep -Seconds $DelaySec
 
-    Stop-Role -Role "Authserver"
+    Stop-Role -Role "Authserver" -Cfg $Cfg
     if (-not (Wait-ForRoleDown -Role "Authserver" -ExpectedPath ([string]$Cfg.Authserver) -TimeoutSec $WaitTimeoutSec)) {
         Log "Graceful shutdown wait timed out for Authserver."
     }
@@ -956,12 +1027,12 @@ function Process-Commands {
 
       if (Try-ConsumeCommandFile -Path $CommandFiles.StopWorld) {
         Log "Command processed: command.stop.world"
-        Stop-Role -Role "Worldserver"
+        Stop-Role -Role "Worldserver" -Cfg $Cfg
     }
 
      if (Try-ConsumeCommandFile -Path $CommandFiles.StopAuthserver) {
         Log "Command processed: command.stop.auth"
-        Stop-Role -Role "Authserver"
+        Stop-Role -Role "Authserver" -Cfg $Cfg
     }
 
     if (Try-ConsumeCommandFile -Path $CommandFiles.StopMySQL) {
