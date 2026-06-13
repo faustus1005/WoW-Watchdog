@@ -3,7 +3,7 @@
 param(
     [int]$RestartCooldown  = 5,
     [int]$WorldserverBurst = 300,  # seconds
-    [int]$MaxRestarts      = 100,  # max restarts within burst window
+    [int]$MaxRestarts      = 20,   # max restarts within burst window (must be reachable given RestartCooldown)
     [int]$ConfigRetrySec   = 10,   # if config invalid/missing, re-check every N seconds
     [int]$HeartbeatEverySec = 1,    # heartbeat update cadence
     [int]$ShutdownDelaySec = 8,  # delay between service stops
@@ -297,6 +297,7 @@ function Test-ProcessRoleRunning {
         # *mismatch* from an *unverifiable* path so we never report a running
         # service as down and trigger a relaunch.
         $sawUnverifiablePath = $false
+        $sawReadableMismatch = $false
         foreach ($proc in $procs) {
             $procPath = $null
             try {
@@ -310,12 +311,17 @@ function Test-ProcessRoleRunning {
 
             try { $procPath = [System.IO.Path]::GetFullPath($procPath) } catch { }
             if ($procPath -ieq $expectedExeFull) { return $true }
+
+            # Readable path pointing elsewhere — this instance is a different install.
+            $sawReadableMismatch = $true
         }
 
-        # Name matched but the path could not be confirmed for any instance. Trust the
-        # name match: a false "not running" here makes the watchdog launch a duplicate
-        # instance every cycle, which can exhaust system memory.
-        if ($sawUnverifiablePath) { return $true }
+        # Name matched but no instance's path could be confirmed against the expected
+        # executable. Trust the bare name match only when we never saw a readable path
+        # pointing at a *different* install: a false "not running" makes the watchdog
+        # spawn duplicates until memory is exhausted, but if same-named processes are
+        # demonstrably from other installs then this role is genuinely stopped.
+        if ($sawUnverifiablePath -and -not $sawReadableMismatch) { return $true }
 
         return $false
     }
@@ -402,6 +408,13 @@ $RestartBurstCount = @{
     Authserver = 0
     Worldserver= 0
 }
+# Once a role hits its limit we stop relaunching until the window resets; this
+# flag throttles the suppression so we log it once instead of on every tick.
+$RestartSuppressed = @{
+    MySQL      = $false
+    Authserver = $false
+    Worldserver= $false
+}
 
 # Legacy script-scope aliases kept for GUI/API telemetry (mirror Worldserver).
 $WorldRestartCount = 0
@@ -422,6 +435,13 @@ $DefaultConfig = [ordered]@{
     PortCheckTtlSec     = 5
     PortCheckFailTtlSec = 15
     PortWarmupSec       = 180
+    # MySQL graceful-shutdown settings: ask the database to flush and exit cleanly
+    # instead of force-killing it. Password is stored in plaintext like the other
+    # secrets in this file; leave blank for a passwordless local root account.
+    MySQLUser               = "root"
+    MySQLPassword           = ""
+    MySQLAdmin              = ""    # optional explicit mysqladmin.exe / mariadb-admin.exe path
+    MySQLShutdownTimeoutSec = 60
     API = [ordered]@{
         Enabled = $false
         Port    = 8099
@@ -562,14 +582,106 @@ function Start-Target {
 }
 
 # -------------------------------
+# Graceful MySQL shutdown
+# -------------------------------
+function Resolve-MySQLAdmin {
+    param($Cfg)
+
+    # Prefer an explicitly configured admin client.
+    $explicit = if ($Cfg) { [string]$Cfg.MySQLAdmin } else { "" }
+    if (-not [string]::IsNullOrWhiteSpace($explicit) -and (Test-Path -LiteralPath $explicit)) {
+        return $explicit
+    }
+
+    # Otherwise derive it from the folder of the configured MySQL binary (and its
+    # neighbouring bin\ folder, the common repack layout: ...\database\bin\).
+    $mysqlPath = if ($Cfg) { [string]$Cfg.MySQL } else { "" }
+    if ([string]::IsNullOrWhiteSpace($mysqlPath)) { return $null }
+
+    $dir = $null
+    try { $dir = Split-Path -Parent $mysqlPath } catch { }
+    if ([string]::IsNullOrWhiteSpace($dir)) { return $null }
+
+    foreach ($d in @($dir, (Join-Path $dir "bin"))) {
+        foreach ($name in @("mysqladmin.exe","mariadb-admin.exe")) {
+            $cand = Join-Path $d $name
+            if (Test-Path -LiteralPath $cand) { return $cand }
+        }
+    }
+    return $null
+}
+
+function Stop-MySQLGracefully {
+    param(
+        [Parameter(Mandatory)]$Cfg,
+        [int]$TimeoutSec = 60
+    )
+
+    # MySQL/MariaDB must flush its buffers and checkpoint on the way down. A forced
+    # kill leaves InnoDB to run crash recovery on the next start (slow) and risks
+    # corruption, so ask the server to shut itself down and wait for it to exit.
+    $admin = Resolve-MySQLAdmin -Cfg $Cfg
+    if (-not $admin) {
+        Log "MySQL graceful shutdown: mysqladmin/mariadb-admin not found (set MySQLAdmin in config); using process stop."
+        return $false
+    }
+
+    $port = [int]$Cfg.MySQLPort
+    $user = if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.MySQLUser)) { [string]$Cfg.MySQLUser } else { "root" }
+    $pass = [string]$Cfg.MySQLPassword
+
+    $adminArgs = @("--host=127.0.0.1", "--port=$port", "--user=$user", "--connect-timeout=5")
+    if (-not [string]::IsNullOrEmpty($pass)) { $adminArgs += "--password=$pass" }
+    $adminArgs += "shutdown"
+
+    try {
+        Log "MySQL graceful shutdown via $admin (user '$user')."
+        $proc = Start-Process -FilePath $admin -ArgumentList $adminArgs -WindowStyle Hidden -PassThru -ErrorAction Stop
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            Log "MySQL graceful shutdown: admin client timed out after $TimeoutSec sec; using process stop."
+            try { $proc.Kill() } catch { }
+            return $false
+        }
+        if ($proc.ExitCode -ne 0) {
+            Log "MySQL graceful shutdown: admin client exited with code $($proc.ExitCode); using process stop."
+            return $false
+        }
+    } catch {
+        Log "MySQL graceful shutdown command failed: $($_). Using process stop."
+        return $false
+    }
+
+    # Confirm the server process is actually gone before reporting success.
+    if (Wait-ForRoleDown -Role "MySQL" -ExpectedPath ([string]$Cfg.MySQL) -TimeoutSec $TimeoutSec) {
+        Log "MySQL shut down cleanly."
+        return $true
+    }
+
+    Log "MySQL still running after graceful shutdown wait ($TimeoutSec sec); using process stop."
+    return $false
+}
+
+# -------------------------------
 # Stop a service/role.
 # -------------------------------
 function Stop-Role {
     param(
         [Parameter(Mandatory)]
         [ValidateSet("MySQL","Authserver","Worldserver")]
-        [string]$Role
+        [string]$Role,
+
+        $Cfg = $null
     )
+
+    # MySQL: attempt a clean database shutdown before falling back to a hard stop so
+    # the server flushes/checkpoints instead of being terminated mid-write.
+    if ($Role -eq "MySQL" -and $Cfg) {
+        $timeout = 60
+        try { if ($Cfg.MySQLShutdownTimeoutSec) { $timeout = [int]$Cfg.MySQLShutdownTimeoutSec } } catch { }
+        if (Stop-MySQLGracefully -Cfg $Cfg -TimeoutSec $timeout) {
+            return
+        }
+    }
 
     # Stop by process name aliases to handle renamed binaries.
     foreach ($p in $ProcessAliases[$Role]) {
@@ -607,7 +719,7 @@ function Stop-All-Gracefully {
     }
     Start-Sleep -Seconds $DelaySec
 
-    Stop-Role -Role "MySQL"
+    Stop-Role -Role "MySQL" -Cfg $Cfg
     if (-not (Wait-ForRoleDown -Role "MySQL" -ExpectedPath ([string]$Cfg.MySQL) -TimeoutSec $WaitTimeoutSec)) {
         Log "Graceful shutdown wait timed out for MySQL."
     }
@@ -729,12 +841,24 @@ function Ensure-Role {
     if (-not $RestartBurstStart[$Role]) {
         $RestartBurstStart[$Role] = $now
         $RestartBurstCount[$Role] = 0
+        $RestartSuppressed[$Role] = $false
     } else {
         $burstAge = ($now - $RestartBurstStart[$Role]).TotalSeconds
         if ($burstAge -gt $WorldserverBurst) {
             $RestartBurstStart[$Role] = $now
             $RestartBurstCount[$Role] = 0
+            $RestartSuppressed[$Role] = $false
         }
+    }
+
+    # Already at the limit for this window: suppress without counting further or
+    # spamming the log (log once, on the transition into suppression).
+    if ($RestartBurstCount[$Role] -ge $MaxRestarts) {
+        if (-not $RestartSuppressed[$Role]) {
+            $RestartSuppressed[$Role] = $true
+            Log "ERROR: $Role restart limit reached ($MaxRestarts in $WorldserverBurst sec). Suppressing restarts until the burst window resets."
+        }
+        return
     }
 
     $RestartBurstCount[$Role]++
@@ -743,11 +867,6 @@ function Ensure-Role {
     if ($Role -eq "Worldserver") {
         $script:WorldBurstStart   = $RestartBurstStart[$Role]
         $script:WorldRestartCount = $RestartBurstCount[$Role]
-    }
-
-    if ($RestartBurstCount[$Role] -gt $MaxRestarts) {
-        Log "ERROR: $Role restart limit exceeded ($($RestartBurstCount[$Role]) > $MaxRestarts in $WorldserverBurst sec). Suppressing restarts."
-        return
     }
 
     $LastRestart[$Role] = Get-Date
@@ -825,7 +944,7 @@ function Process-Commands {
 
     if (Try-ConsumeCommandFile -Path $CommandFiles.StopMySQL) {
         Log "Command processed: command.stop.mysql"
-        Stop-Role -Role "MySQL"
+        Stop-Role -Role "MySQL" -Cfg $Cfg
     }
 }
 
