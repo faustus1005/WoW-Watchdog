@@ -8,6 +8,10 @@
     "AuthserverPort": 1119,
     "WorldserverPort": 8086,
     "PortCheckTtlSec": 5,
+    "MySQLUser": "root",
+    "MySQLPassword": "",
+    "MySQLAdmin": "",
+    "MySQLShutdownTimeoutSec": 60,
     "API": {
         "Enabled": false,
         "Port": 8099,
