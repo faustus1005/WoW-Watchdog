@@ -107,7 +107,7 @@ function Invoke-WithLogLock {
     $mutex = $null
     $hasLock = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "Global\\WoWWatchdog_Log")
+        $mutex = New-Object System.Threading.Mutex($false, "Global\WoWWatchdog_Log")
         $hasLock = $mutex.WaitOne(2000)
     } catch {
         $hasLock = $false
@@ -867,6 +867,23 @@ function Ensure-Role {
     if ($Role -eq "Worldserver") {
         $script:WorldBurstStart   = $RestartBurstStart[$Role]
         $script:WorldRestartCount = $RestartBurstCount[$Role]
+    }
+
+    # If the process is still running at this point it is wedged: up, but its port
+    # never became ready within the warmup window. Relaunching without stopping it
+    # would spawn a *duplicate* instance every cycle (bounded only by the burst cap),
+    # which is exactly the memory-exhaustion failure the burst protection guards
+    # against. Stop the stale instance first so this is a genuine restart, not a
+    # second copy. Skip the relaunch this cycle if it refuses to die, so we never
+    # accumulate duplicates.
+    if ($processRunning) {
+        Log "$Role is running but unhealthy (port $Port not ready after $PortWarmupSec sec warmup) — stopping stale instance before restart."
+        try { Stop-Role -Role $Role } catch { Log "ERROR stopping stale $Role: $($_)" }
+        if ($script:PortWarmupStart) { $script:PortWarmupStart.Remove($Role) | Out-Null }
+        if (-not (Wait-ForRoleDown -Role $Role -ExpectedPath $Path -TimeoutSec 15)) {
+            Log "WARNING: stale $Role still running after stop request; deferring relaunch to avoid duplicate instances."
+            return
+        }
     }
 
     $LastRestart[$Role] = Get-Date
