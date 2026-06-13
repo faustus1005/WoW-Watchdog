@@ -798,7 +798,9 @@ function Ensure-Role {
 
         [int]$NegativeCacheTtlSec = 15,
 
-        [int]$PortWarmupSec = 180
+        [int]$PortWarmupSec = 180,
+
+        $Cfg = $null
     )
 
     # Manual hold (GUI-requested stop) — do not restart.
@@ -878,7 +880,10 @@ function Ensure-Role {
     # accumulate duplicates.
     if ($processRunning) {
         Log "$Role is running but unhealthy (port $Port not ready after $PortWarmupSec sec warmup) — stopping stale instance before restart."
-        try { Stop-Role -Role $Role } catch { Log "ERROR stopping stale $Role: $($_)" }
+        # Pass the config so MySQL recycles via the same graceful shutdown used by
+        # normal stop commands (flush/checkpoint before exit), only force-killing if
+        # the database is unreachable. Without it InnoDB could be terminated mid-write.
+        try { Stop-Role -Role $Role -Cfg $Cfg } catch { Log "ERROR stopping stale $Role: $($_)" }
         if ($script:PortWarmupStart) { $script:PortWarmupStart.Remove($Role) | Out-Null }
         if (-not (Wait-ForRoleDown -Role $Role -ExpectedPath $Path -TimeoutSec 15)) {
             Log "WARNING: stale $Role still running after stop request; deferring relaunch to avoid duplicate instances."
@@ -1515,14 +1520,14 @@ while ($true) {
         $portCheckFailTtlSec = [int]$cfg.PortCheckFailTtlSec
         $portWarmupSec = [int]$cfg.PortWarmupSec
 
-        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 
 if (Test-RoleHealthy -Role "MySQL" -ExpectedPath ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
-    Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+    Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 }
 
 if (Test-RoleHealthy -Role "Authserver" -ExpectedPath ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
-    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 }
 
 
