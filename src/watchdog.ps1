@@ -288,15 +288,34 @@ function Test-ProcessRoleRunning {
         $procs = @()
         try { $procs = Get-Process -Name $expectedName -ErrorAction SilentlyContinue } catch { }
 
+        # No process with that image name exists — the role is genuinely down.
+        if (-not $procs -or @($procs).Count -eq 0) { return $false }
+
+        # A process with the right image name is present, but we may not be able to
+        # read its full path (e.g. a 64-bit core queried from a 32-bit host, or
+        # modules still loading right after launch). Distinguish a confirmed path
+        # *mismatch* from an *unverifiable* path so we never report a running
+        # service as down and trigger a relaunch.
+        $sawUnverifiablePath = $false
         foreach ($proc in $procs) {
+            $procPath = $null
             try {
                 $procPath = $proc.Path
                 if (-not $procPath) { $procPath = $proc.MainModule.FileName }
-                if (-not $procPath) { continue }
-                try { $procPath = [System.IO.Path]::GetFullPath($procPath) } catch { }
-                if ($procPath -and ($procPath -ieq $expectedExeFull)) { return $true }
-            } catch { }
+            } catch {
+                $procPath = $null
+            }
+
+            if (-not $procPath) { $sawUnverifiablePath = $true; continue }
+
+            try { $procPath = [System.IO.Path]::GetFullPath($procPath) } catch { }
+            if ($procPath -ieq $expectedExeFull) { return $true }
         }
+
+        # Name matched but the path could not be confirmed for any instance. Trust the
+        # name match: a false "not running" here makes the watchdog launch a duplicate
+        # instance every cycle, which can exhaust system memory.
+        if ($sawUnverifiablePath) { return $true }
 
         return $false
     }
@@ -371,6 +390,20 @@ $LastRestart = @{
     Worldserver= Get-Date "2000-01-01"
 }
 
+# Per-role crash-loop tracking. Hashtable contents are mutated in place so the
+# counts persist across Ensure-Role calls regardless of variable scope.
+$RestartBurstStart = @{
+    MySQL      = $null
+    Authserver = $null
+    Worldserver= $null
+}
+$RestartBurstCount = @{
+    MySQL      = 0
+    Authserver = 0
+    Worldserver= 0
+}
+
+# Legacy script-scope aliases kept for GUI/API telemetry (mirror Worldserver).
 $WorldRestartCount = 0
 $WorldBurstStart   = $null
 
@@ -689,25 +722,32 @@ function Ensure-Role {
     $delta = ((Get-Date) - $LastRestart[$Role]).TotalSeconds
     if ($delta -lt $RestartCooldown) { return }
 
-    # Worldserver crash-loop protection.
-    if ($Role -eq "Worldserver") {
-        $now = Get-Date
-        if (-not $WorldBurstStart) {
-            $WorldBurstStart   = $now
-            $WorldRestartCount = 0
-        } else {
-            $burstAge = ($now - $WorldBurstStart).TotalSeconds
-            if ($burstAge -gt $WorldserverBurst) {
-                $WorldBurstStart   = $now
-                $WorldRestartCount = 0
-            }
+    # Crash-loop protection for every role: bound how many times we relaunch a role
+    # within the burst window so a stuck/failed detection cannot spawn unbounded
+    # instances and exhaust system memory. (Hashtable mutation persists across calls.)
+    $now = Get-Date
+    if (-not $RestartBurstStart[$Role]) {
+        $RestartBurstStart[$Role] = $now
+        $RestartBurstCount[$Role] = 0
+    } else {
+        $burstAge = ($now - $RestartBurstStart[$Role]).TotalSeconds
+        if ($burstAge -gt $WorldserverBurst) {
+            $RestartBurstStart[$Role] = $now
+            $RestartBurstCount[$Role] = 0
         }
+    }
 
-        $WorldRestartCount++
-        if ($WorldRestartCount -gt $MaxRestarts) {
-            Log "ERROR: Worldserver restart limit exceeded ($WorldRestartCount > $MaxRestarts in $WorldserverBurst sec). Suppressing restarts."
-            return
-        }
+    $RestartBurstCount[$Role]++
+
+    # Mirror Worldserver counters into the legacy script-scope vars for telemetry.
+    if ($Role -eq "Worldserver") {
+        $script:WorldBurstStart   = $RestartBurstStart[$Role]
+        $script:WorldRestartCount = $RestartBurstCount[$Role]
+    }
+
+    if ($RestartBurstCount[$Role] -gt $MaxRestarts) {
+        Log "ERROR: $Role restart limit exceeded ($($RestartBurstCount[$Role]) > $MaxRestarts in $WorldserverBurst sec). Suppressing restarts."
+        return
     }
 
     $LastRestart[$Role] = Get-Date
