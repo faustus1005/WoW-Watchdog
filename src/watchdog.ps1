@@ -509,6 +509,36 @@ function Ensure-ConfigSchema {
     return $changed
 }
 
+function Migrate-WarmupSettings {
+    param([Parameter(Mandatory)]$Cfg)
+
+    # Seed the per-role warmup windows from the (possibly operator-raised) global
+    # PortWarmupSec the first time a pre-existing config is upgraded, taking whichever
+    # is larger. This guarantees an upgrade never SHORTENS a grace period someone set
+    # to accommodate slow MySQL/worldserver startups (e.g. PortWarmupSec=1800 would
+    # otherwise collapse to the 600/900 defaults and restart a role mid-startup).
+    # Runs before Ensure-ConfigSchema so these seeded values win over the plain
+    # defaults, and only acts when a field is absent so explicit values are untouched.
+    if (-not $Cfg) { return $false }
+
+    $changed = $false
+    $globalWarmup = 0
+    try { $globalWarmup = [int]$Cfg.PortWarmupSec } catch { $globalWarmup = 0 }
+
+    foreach ($seed in @(
+        @{ Name = "MySQLWarmupSec";       Default = 600 },
+        @{ Name = "WorldserverWarmupSec"; Default = 900 }
+    )) {
+        if (-not $Cfg.PSObject.Properties[$seed.Name]) {
+            $value = [Math]::Max([int]$seed.Default, $globalWarmup)
+            $Cfg | Add-Member -MemberType NoteProperty -Name $seed.Name -Value $value
+            $changed = $true
+        }
+    }
+
+    return $changed
+}
+
 function Load-ConfigSafe {
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
         if ($global:LastConfigLoadState -ne "MissingConfig") {
@@ -523,7 +553,12 @@ function Load-ConfigSafe {
     try {
         $cfg = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
         if ($cfg) {
-            if (Ensure-ConfigSchema -Cfg $cfg -Defaults $DefaultConfig) {
+            $needsWrite = $false
+            # Migrate first so per-role warmups inherit a raised PortWarmupSec, then let
+            # the generic schema fill any other new defaults.
+            if (Migrate-WarmupSettings -Cfg $cfg) { $needsWrite = $true }
+            if (Ensure-ConfigSchema -Cfg $cfg -Defaults $DefaultConfig) { $needsWrite = $true }
+            if ($needsWrite) {
                 Write-ConfigFile -Path $ConfigPath -Object $cfg
             }
         }
@@ -1606,15 +1641,14 @@ while ($true) {
         # Ensure roles (dependency order is enforced below).
         $portCheckTtlSec = [int]$cfg.PortCheckTtlSec
         $portCheckFailTtlSec = [int]$cfg.PortCheckFailTtlSec
+        # Warmup windows are honored exactly as configured. Worldserver and MySQL get
+        # their own, more generous values (map loading / InnoDB recovery) so the
+        # watchdog does not restart them mid-startup; a value of 0 means "no warmup"
+        # (immediate recovery), which Ensure-Role supports by skipping its grace block.
+        # Schema/migration guarantee these fields exist, so no fallback is needed here.
         $portWarmupSec = [int]$cfg.PortWarmupSec
-        if ($portWarmupSec -le 0) { $portWarmupSec = 180 }
-        # Worldserver and MySQL can legitimately take far longer to open their port
-        # (map loading / InnoDB recovery); give them their own, more generous windows
-        # so the watchdog does not restart them mid-startup.
         $mysqlWarmupSec = [int]$cfg.MySQLWarmupSec
-        if ($mysqlWarmupSec -le 0) { $mysqlWarmupSec = 600 }
         $worldWarmupSec = [int]$cfg.WorldserverWarmupSec
-        if ($worldWarmupSec -le 0) { $worldWarmupSec = 900 }
 
         Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $mysqlWarmupSec -Cfg $cfg
 
