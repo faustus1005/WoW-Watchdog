@@ -1054,14 +1054,18 @@ function Parse-ReleaseVersion {
     $t = ""
     if ($TagName) { $t = $TagName.Trim() }
 
-    # Extract the first dotted-number group so tags like "v1.2.7", "1.2.7-beta",
-    # "release-1.2", or "v2" all parse instead of throwing on the bare [version] cast.
-    $m = [regex]::Match($t, '(\d+(?:\.\d+){0,3})')
+    # Prefer a version token introduced by 'v' (e.g. "v1.2.8", or
+    # "release-2026.06.14-v1.2.8" where a date prefix must NOT be mistaken for the
+    # version), falling back to the first dotted-number group for plain tags ("1.2.7").
+    $m = [regex]::Match($t, '(?:^|[^0-9A-Za-z])[vV](\d+(?:\.\d+){0,3})')
+    if (-not $m.Success) {
+        $m = [regex]::Match($t, '(\d+(?:\.\d+){0,3})')
+    }
     if (-not $m.Success) {
         throw "Could not parse a version number from tag '$TagName'."
     }
 
-    $num = $m.Value
+    $num = $m.Groups[1].Value
     if ($num -notmatch '\.') { $num = "$num.0" }   # [version] needs at least major.minor
 
     [version]$num
@@ -5848,6 +5852,44 @@ function Log([string]$m){
   try { Add-Content -LiteralPath $LogPath -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8 } catch {}
 }
 
+try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch {}
+
+function Notify([string]$title, [string]$msg, $icon){
+  Log ("NOTIFY [" + $title + "] " + $msg)
+  try {
+    [System.Windows.Forms.MessageBox]::Show($msg, $title, [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
+  } catch { Log ("Notify failed: " + $_.Exception.Message) }
+}
+
+function Invoke-Relaunch {
+  try {
+    $target = $null
+    if ($InstallExe -and (Test-Path -LiteralPath $InstallExe)) { $target = $InstallExe }
+    elseif ($FallbackExe -and (Test-Path -LiteralPath $FallbackExe)) { $target = $FallbackExe }
+    if ($target) {
+      Log ("Relaunching GUI: " + $target)
+      if ($WorkDir -and (Test-Path -LiteralPath $WorkDir)) {
+        Start-Process -FilePath $target -WorkingDirectory $WorkDir | Out-Null
+      } else {
+        Start-Process -FilePath $target | Out-Null
+      }
+    } else {
+      Log "No GUI exe found to relaunch."
+    }
+  } catch { Log ("Relaunch failed: " + $_.Exception.Message) }
+}
+
+function Clear-StopSignal {
+  if ($StopSignalFile) {
+    try {
+      if (Test-Path -LiteralPath $StopSignalFile) {
+        Remove-Item -LiteralPath $StopSignalFile -Force -ErrorAction SilentlyContinue
+        Log "Cleared stop signal."
+      }
+    } catch {}
+  }
+}
+
 Log "Updater shim started. GuiPid=$GuiPid"
 Log ("Installer=" + $Installer)
 
@@ -5861,12 +5903,14 @@ try {
 Start-Sleep -Milliseconds 750
 
 # Stop the Watchdog service so nssm.exe / scripts unlock before files are replaced.
+# Only signal a graceful role shutdown when the service is actually running.
+$serviceStopped = $true
 try {
-  if ($StopSignalFile) {
-    try { New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null; Log ("Wrote stop signal: " + $StopSignalFile) } catch {}
-  }
   $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   if ($svc -and $svc.Status -ne 'Stopped') {
+    if ($StopSignalFile) {
+      try { New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null; Log ("Wrote stop signal: " + $StopSignalFile) } catch {}
+    }
     Log ("Stopping service: " + $ServiceName)
     try { Stop-Service -Name $ServiceName -Force -ErrorAction Stop } catch { Log ("Stop-Service error: " + $_.Exception.Message) }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -5875,11 +5919,27 @@ try {
       try { $svc.Refresh() } catch {}
       if ($svc.Status -eq 'Stopped') { break }
     }
+    $serviceStopped = ($svc.Status -eq 'Stopped')
     Log ("Service status after stop: " + $svc.Status)
   } else {
     Log "Service not running or not installed; continuing."
   }
-} catch { Log ("Service stop phase error: " + $_.Exception.Message) }
+} catch {
+  Log ("Service stop phase error: " + $_.Exception.Message)
+  $serviceStopped = $false
+}
+
+# Remove any stop signal so the freshly-started service does not immediately self-stop.
+Clear-StopSignal
+
+# Abort if the service could not be stopped: replacing nssm.exe / watchdog.ps1 while
+# they are still in use can fail or partially apply the update.
+if (-not $serviceStopped) {
+  Notify "Update Aborted" "WoW Watchdog could not stop its background service, so the update was NOT applied and your current version is unchanged. Please stop the WoWWatchdog service manually and try again." ([System.Windows.Forms.MessageBoxIcon]::Error)
+  Log "ABORT: service did not reach Stopped; installer not run."
+  Invoke-Relaunch
+  return
+}
 
 # Run the installer silently and wait for it to finish.
 $code = -1
@@ -5892,32 +5952,49 @@ try {
 }
 Log ("Installer exit code: " + $code)
 
-# The installer's [Run] section restarts the service; verify as a fallback.
+# A nonzero exit means the update did not apply cleanly. Surface it instead of
+# silently following the success path while the GUI is closed and the shim hidden.
+if ($code -ne 0) {
+  Notify "Update Failed" ("The WoW Watchdog installer exited with code {0}. The update may not have been applied - please download the latest release manually." -f $code) ([System.Windows.Forms.MessageBoxIcon]::Error)
+  Log "ABORT: installer returned a nonzero exit code."
+  # Restore monitoring even though the install failed.
+  try {
+    $svcF = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svcF -and $svcF.Status -ne 'Running') { try { Start-Service -Name $ServiceName -ErrorAction SilentlyContinue } catch {} }
+  } catch {}
+  Invoke-Relaunch
+  return
+}
+
+# Verify the service is running again (the installer's [Run] section restarts it).
+$serviceRunning = $false
 try {
   $svc2 = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-  if ($svc2 -and $svc2.Status -ne 'Running') {
-    Log "Service not running after install; attempting start."
-    try { Start-Service -Name $ServiceName -ErrorAction Stop } catch { Log ("Start-Service error: " + $_.Exception.Message) }
-  }
-} catch {}
-
-# Relaunch the GUI (prefer the freshly-installed exe).
-try {
-  $target = $null
-  if ($InstallExe -and (Test-Path -LiteralPath $InstallExe)) { $target = $InstallExe }
-  elseif ($FallbackExe -and (Test-Path -LiteralPath $FallbackExe)) { $target = $FallbackExe }
-  if ($target) {
-    Log ("Relaunching GUI: " + $target)
-    if ($WorkDir -and (Test-Path -LiteralPath $WorkDir)) {
-      Start-Process -FilePath $target -WorkingDirectory $WorkDir | Out-Null
-    } else {
-      Start-Process -FilePath $target | Out-Null
+  if ($svc2) {
+    if ($svc2.Status -ne 'Running') {
+      Log "Service not running after install; attempting start."
+      try { Start-Service -Name $ServiceName -ErrorAction Stop } catch { Log ("Start-Service error: " + $_.Exception.Message) }
+      $sw2 = [Diagnostics.Stopwatch]::StartNew()
+      while ($sw2.Elapsed.TotalSeconds -lt 30) {
+        Start-Sleep -Milliseconds 500
+        try { $svc2.Refresh() } catch {}
+        if ($svc2.Status -eq 'Running') { break }
+      }
     }
+    $serviceRunning = ($svc2.Status -eq 'Running')
+    Log ("Service status after install: " + $svc2.Status)
   } else {
-    Log "No GUI exe found to relaunch."
+    Log "Service not found after install."
   }
-} catch { Log ("Relaunch failed: " + $_.Exception.Message) }
+} catch { Log ("Service verify error: " + $_.Exception.Message) }
 
+# The watchdog failing to come back leaves servers unmonitored - make that visible.
+if (-not $serviceRunning) {
+  Notify "Watchdog Not Running" "The update installed, but the WoW Watchdog service is not running. Your servers may be unmonitored. Please start the WoWWatchdog service or restart the app." ([System.Windows.Forms.MessageBoxIcon]::Warning)
+}
+
+Log ("Update complete. Service running: " + $serviceRunning)
+Invoke-Relaunch
 Log "Updater shim finished."
 '@
 
