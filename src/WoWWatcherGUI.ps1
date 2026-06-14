@@ -198,8 +198,8 @@ function Write-AtomicFile {
 }
 
 $AppVersion = [version]"1.2.7"
-$RepoOwner  = "FAUSTUS1005"
-$RepoName   = "WoW-Watchdog"
+$RepoOwner  = "faustus1005"
+$RepoName   = "WoW-Watchdog-SPP-Legion"
 
 # -------------------------------------------------
 # Paths / constants
@@ -1053,8 +1053,18 @@ function Parse-ReleaseVersion {
 
     $t = ""
     if ($TagName) { $t = $TagName.Trim() }
-    if ($t.StartsWith("v")) { $t = $t.Substring(1) }
-    [version]$t
+
+    # Extract the first dotted-number group so tags like "v1.2.7", "1.2.7-beta",
+    # "release-1.2", or "v2" all parse instead of throwing on the bare [version] cast.
+    $m = [regex]::Match($t, '(\d+(?:\.\d+){0,3})')
+    if (-not $m.Success) {
+        throw "Could not parse a version number from tag '$TagName'."
+    }
+
+    $num = $m.Value
+    if ($num -notmatch '\.') { $num = "$num.0" }   # [version] needs at least major.minor
+
+    [version]$num
 }
 
 
@@ -1425,75 +1435,6 @@ function Start-ServiceAndWait {
     }
 
     throw "Service '$Name' did not reach Running state within ${TimeoutSeconds}s."
-}
-
-function Download-FileWithProgress {
-    param(
-        [Parameter(Mandatory)][string]$Url,
-        [Parameter(Mandatory)][string]$OutFile
-    )
-
-    # Ensure TLS 1.2 for GitHub
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
-    if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
-
-    $wc = New-Object System.Net.WebClient
-    try {
-        $wc.Headers.Add("User-Agent", "WoWWatchdog")
-
-        $script:dlCompleted = $false
-        $script:dlError     = $null
-
-        $wc.add_DownloadProgressChanged({
-            param($s, $e)
-            Set-UpdateFlowUi -Text ("Downloading update. {0}%" -f $e.ProgressPercentage) -Percent $e.ProgressPercentage -Show $true -Indeterminate $false
-        })
-
-        $wc.add_DownloadFileCompleted({
-            param($s, $e)
-            if ($e.Error) { $script:dlError = $e.Error }
-            $script:dlCompleted = $true
-        })
-
-        Set-UpdateFlowUi -Text "Starting download." -Percent 0 -Show $true -Indeterminate $true
-        $wc.DownloadFileAsync([Uri]$Url, $OutFile)
-
-        while (-not $script:dlCompleted) { Start-Sleep -Milliseconds 120 }
-
-        if ($script:dlError) { throw "Download failed: $($script:dlError.Message)" }
-        if (-not (Test-Path $OutFile)) { throw "Download did not create file: $OutFile" }
-    } finally {
-        if ($wc) { $wc.Dispose() }
-    }
-
-    return $true
-}
-
-function Run-InstallerAndWait {
-    param(
-        [Parameter(Mandatory)][string]$InstallerPath
-    )
-
-    if (-not (Test-Path $InstallerPath)) {
-        throw "Installer not found: $InstallerPath"
-    }
-
-    $installerArgs = @(
-        "/VERYSILENT",
-        "/SUPPRESSMSGBOXES",
-        "/NORESTART",
-        "/SP-"
-    )
-
-    Set-UpdateFlowUi -Text "Running installer." -Percent 100 -Show $true -Indeterminate $true
-
-    $p = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -PassThru -Wait -ErrorAction Stop
-    if ($p.ExitCode -ne 0) {
-        throw "Installer failed with exit code $($p.ExitCode)."
-    }
-
-    return $true
 }
 
 function Read-UncPathFromUser {
@@ -5852,128 +5793,377 @@ $BtnSaveDbPassword.Add_Click({
     }
 })
 
-$BtnUpdateNow.Add_Click({
+# -------------------------------------------------
+# Self-update (runspace-safe; works under PS2EXE)
+#
+# The previous implementation used a BackgroundWorker whose DoWork / WebClient
+# event scriptblocks could not reach the (busy) main runspace, so clicking
+# "Update Now" could silently do nothing or hang forever on the download.
+# This version runs the download in a dedicated runspace and polls it from a
+# DispatcherTimer on the UI thread (the same pattern the SPP V2 updater uses),
+# then hands off to an external updater shim so the running EXE can be replaced.
+# -------------------------------------------------
+$script:SelfUpdateJob   = $null
+$script:SelfUpdateTimer = $null
 
-    $worker = New-Object System.ComponentModel.BackgroundWorker
-    $worker.WorkerReportsProgress = $false
+function Invoke-SelfUpdateInstaller {
+    param([Parameter(Mandatory)][string]$InstallerPath)
 
-    $worker.add_DoWork({
-        param($sender, $e)
+    if (-not (Test-Path -LiteralPath $InstallerPath)) {
+        throw "Installer not found: $InstallerPath"
+    }
+
+    $updLogDir = Join-Path $DataDir "update-logs"
+    try { if (-not (Test-Path -LiteralPath $updLogDir)) { New-Item -ItemType Directory -Path $updLogDir -Force | Out-Null } } catch {}
+    $updLog = Join-Path $updLogDir ("self_update_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+    $installExe = Join-Path $InstallDir "WoWWatcher.exe"
+
+    # Embed inputs as single-quoted PowerShell literals (doubling any single quotes)
+    # so the shim has no dependency on env-var inheritance or command-line quoting.
+    $qInstaller  = "'" + ($InstallerPath  -replace "'", "''") + "'"
+    $qInstallExe = "'" + ($installExe     -replace "'", "''") + "'"
+    $qFallback   = "'" + ($ExePath        -replace "'", "''") + "'"
+    $qWorkDir    = "'" + ($InstallDir     -replace "'", "''") + "'"
+    $qService    = "'" + ($ServiceName    -replace "'", "''") + "'"
+    $qStopSignal = "'" + ($StopSignalFile -replace "'", "''") + "'"
+    $qLog        = "'" + ($updLog         -replace "'", "''") + "'"
+
+    $header = @"
+`$GuiPid         = $([int]$PID)
+`$Installer      = $qInstaller
+`$InstallExe     = $qInstallExe
+`$FallbackExe    = $qFallback
+`$WorkDir        = $qWorkDir
+`$ServiceName    = $qService
+`$StopSignalFile = $qStopSignal
+`$LogPath        = $qLog
+"@
+
+    # The shim runs in its own elevated PowerShell process. It waits for THIS
+    # process to exit (so WoWWatcher.exe unlocks), stops the service so nssm.exe
+    # unlocks, runs the installer, then relaunches the freshly-installed GUI.
+    $body = @'
+function Log([string]$m){
+  try { Add-Content -LiteralPath $LogPath -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8 } catch {}
+}
+
+Log "Updater shim started. GuiPid=$GuiPid"
+Log ("Installer=" + $Installer)
+
+# Wait for the GUI to exit so its EXE unlocks.
+try {
+  if ($GuiPid -gt 0) {
+    $p = Get-Process -Id $GuiPid -ErrorAction SilentlyContinue
+    if ($p) { Log "Waiting for GUI to exit..."; try { $p.WaitForExit(60000) | Out-Null } catch {} }
+  }
+} catch {}
+Start-Sleep -Milliseconds 750
+
+# Stop the Watchdog service so nssm.exe / scripts unlock before files are replaced.
+try {
+  if ($StopSignalFile) {
+    try { New-Item -Path $StopSignalFile -ItemType File -Force | Out-Null; Log ("Wrote stop signal: " + $StopSignalFile) } catch {}
+  }
+  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -ne 'Stopped') {
+    Log ("Stopping service: " + $ServiceName)
+    try { Stop-Service -Name $ServiceName -Force -ErrorAction Stop } catch { Log ("Stop-Service error: " + $_.Exception.Message) }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt 60) {
+      Start-Sleep -Milliseconds 500
+      try { $svc.Refresh() } catch {}
+      if ($svc.Status -eq 'Stopped') { break }
+    }
+    Log ("Service status after stop: " + $svc.Status)
+  } else {
+    Log "Service not running or not installed; continuing."
+  }
+} catch { Log ("Service stop phase error: " + $_.Exception.Message) }
+
+# Run the installer silently and wait for it to finish.
+$code = -1
+try {
+  Log "Launching installer (silent)..."
+  $proc = Start-Process -FilePath $Installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -PassThru -Wait -ErrorAction Stop
+  $code = $proc.ExitCode
+} catch {
+  Log ("Installer launch failed: " + $_.Exception.Message)
+}
+Log ("Installer exit code: " + $code)
+
+# The installer's [Run] section restarts the service; verify as a fallback.
+try {
+  $svc2 = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  if ($svc2 -and $svc2.Status -ne 'Running') {
+    Log "Service not running after install; attempting start."
+    try { Start-Service -Name $ServiceName -ErrorAction Stop } catch { Log ("Start-Service error: " + $_.Exception.Message) }
+  }
+} catch {}
+
+# Relaunch the GUI (prefer the freshly-installed exe).
+try {
+  $target = $null
+  if ($InstallExe -and (Test-Path -LiteralPath $InstallExe)) { $target = $InstallExe }
+  elseif ($FallbackExe -and (Test-Path -LiteralPath $FallbackExe)) { $target = $FallbackExe }
+  if ($target) {
+    Log ("Relaunching GUI: " + $target)
+    if ($WorkDir -and (Test-Path -LiteralPath $WorkDir)) {
+      Start-Process -FilePath $target -WorkingDirectory $WorkDir | Out-Null
+    } else {
+      Start-Process -FilePath $target | Out-Null
+    }
+  } else {
+    Log "No GUI exe found to relaunch."
+  }
+} catch { Log ("Relaunch failed: " + $_.Exception.Message) }
+
+Log "Updater shim finished."
+'@
+
+    $shim = $header + "`r`n" + $body
+
+    # Write the shim to a space-free, writable location.
+    $shimPath = Join-Path $DataDir ("updater_{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
+    Set-Content -LiteralPath $shimPath -Value $shim -Encoding UTF8 -Force
+
+    Add-GuiLog ("Self-update: launching updater. Log: {0}" -f $updLog)
+    Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File', "`"$shimPath`"") `
+        -WindowStyle Hidden | Out-Null
+
+    # Close the GUI so the installer can replace WoWWatcher.exe; the shim relaunches it.
+    Set-UpdateFlowUi -Text "Installing update. The app will close and reopen..." -Percent 100 -Show $true -Indeterminate $true
+    Start-Sleep -Milliseconds 400
+    $Window.Close()
+}
+
+function Complete-WatchdogSelfUpdateTick {
+    try {
+        $job = $script:SelfUpdateJob
+        if (-not $job) {
+            try { if ($script:SelfUpdateTimer) { $script:SelfUpdateTimer.Stop() } } catch {}
+            return
+        }
+
+        $sh = $job.Shared
+
+        # Mirror background progress onto the UI.
         try {
-            Set-UpdateButtonsEnabled -Enabled $false
-            Set-UpdateFlowUi -Text "Preparing update." -Percent 0 -Show $true -Indeterminate $true
-            Add-GuiLog "Self-update started."
+            Set-UpdateFlowUi -Text ([string]$sh.Status) -Percent ([int]$sh.Percent) -Show $true -Indeterminate ([bool]$sh.Indeterminate)
+        } catch {}
 
-            # Reuse your repo settings
-            $Owner = $RepoOwner
-            $Repo  = $RepoName
+        # Drain queued log lines.
+        $line = $null
+        while ($sh.Logs.TryDequeue([ref]$line)) { Add-GuiLog $line }
 
-            # Pull latest release
-            Set-UpdateFlowUi -Text "Fetching latest release." -Percent 0 -Show $true -Indeterminate $true
-            $rel = Get-LatestGitHubRelease -Owner $Owner -Repo $Repo
-            
-            # Find expected asset
-            $asset = $rel.assets | Where-Object { $_.name -eq "WoWWatchdog-Setup.exe" } | Select-Object -First 1
-            if (-not $asset) {
-                $names = @()
-                if ($rel.assets) { $names = $rel.assets | ForEach-Object { $_.name } }
-                throw "Could not find WoWWatchdog-Setup.exe in latest release. Found: $($names -join ', ')"
-            }
+        if (-not $job.Async.IsCompleted) { return }
 
-            # Step 1: Gracefully stop service
-            Set-UpdateFlowUi -Text "Stopping WoWWatchdog service (graceful)." -Percent 0 -Show $true -Indeterminate $true
-            try {
-                [void](Stop-ServiceAndWait -Name $ServiceName -TimeoutSeconds 45)
-            } catch {
-                # If stop fails, abort update (safer than updating binaries mid-run)
-                throw "Failed to stop service safely. $($_.Exception.Message)"
-            }
-
-            # Step 2: Download installer with progress
-            $tempInstaller = Join-Path $env:TEMP "WoWWatchdog-Setup.exe"
-            [void](Download-FileWithProgress -Url $asset.browser_download_url -OutFile $tempInstaller)
-
-            # Optional sanity check on size (avoid HTML/403 pages)
-            $fi = Get-Item $tempInstaller -ErrorAction Stop
-            if ($fi.Length -lt 200000) { # 200KB floor, tune if needed
-                throw "Downloaded installer is unexpectedly small ($($fi.Length) bytes). Aborting."
-            }
-
-            # Step 3: Run installer
-            [void](Run-InstallerAndWait -InstallerPath $tempInstaller)
-
-            # Step 4: Prompt restart actions on UI thread
-            $Window.Dispatcher.Invoke([action]{
-                Set-UpdateFlowUi -Text "Update installed." -Percent 100 -Show $true -Indeterminate $false
-
-                $restartSvc = [System.Windows.MessageBox]::Show(
-                    "Update installed successfully.`n`nRestart the WoWWatchdog service now?",
-                    "Update Complete",
-                    [System.Windows.MessageBoxButton]::YesNo,
-                    [System.Windows.MessageBoxImage]::Question
-                )
-
-                if ($restartSvc -eq [System.Windows.MessageBoxResult]::Yes) {
-                    try {
-                        Set-UpdateFlowUi -Text "Starting WoWWatchdog service." -Percent 100 -Show $true -Indeterminate $true
-                        Start-ServiceAndWait -Name $ServiceName -TimeoutSeconds 30 | Out-Null
-                        Add-GuiLog "Service restarted after update."
-                    } catch {
-                        Add-GuiLog "ERROR: Service restart failed: $_"
-                        [System.Windows.MessageBox]::Show(
-                            "Update installed, but service restart failed:`n$($_.Exception.Message)",
-                            "Service Restart Failed",
-                            "OK",
-                            "Error"
-                        ) | Out-Null
-                    }
-                }
-
-                $restartGui = [System.Windows.MessageBox]::Show(
-                    "Restart the GUI now to ensure all updated files are loaded?",
-                    "Restart Recommended",
-                    [System.Windows.MessageBoxButton]::YesNo,
-                    [System.Windows.MessageBoxImage]::Question
-                )
-
-                if ($restartGui -eq [System.Windows.MessageBoxResult]::Yes) {
-                    try {
-                        # Relaunch same executable (works if packaged as exe)
-                        Start-Process -FilePath $ExePath -WorkingDirectory $ScriptDir | Out-Null
-                        $Window.Close()
-                    } catch {
-                        Add-GuiLog "ERROR: Failed to relaunch GUI: $_"
-                    }
-                }
-
-                Set-UpdateButtonsEnabled -Enabled $true
-                Set-UpdateFlowUi -Text "Ready." -Percent 0 -Show $false
-            })
+        # Job finished: collect the result object.
+        $result = $null
+        try {
+            $out = $job.PowerShell.EndInvoke($job.Async)
+            if ($out) { foreach ($o in $out) { if ($o) { $result = $o } } }
+        } catch {
+            $result = [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; InstallerPath = $null; Tag = $null }
         }
-        catch {
-            $errMsg = $_.Exception.Message
-            Add-GuiLog ("ERROR: Self-update failed: {0}" -f $errMsg)
-            try {
-                $Window.Dispatcher.Invoke([action]{
+
+        # Final drain after completion.
+        $line = $null
+        while ($sh.Logs.TryDequeue([ref]$line)) { Add-GuiLog $line }
+
+        # Tear down the runspace + timer.
+        try { $job.PowerShell.Dispose() } catch {}
+        try { $job.Runspace.Close() } catch {}
+        try { $job.Runspace.Dispose() } catch {}
+        $script:SelfUpdateJob = $null
+        try { if ($script:SelfUpdateTimer) { $script:SelfUpdateTimer.Stop() } } catch {}
+
+        if ($result -and $result.Ok) {
+            $tag = [string]$result.Tag
+            $verText = $tag
+            try { $verText = (Parse-ReleaseVersion $tag).ToString() } catch {}
+
+            Set-UpdateFlowUi -Text ("Update {0} downloaded." -f $verText) -Percent 100 -Show $true -Indeterminate $false
+
+            $go = [System.Windows.MessageBox]::Show(
+                ("Update {0} downloaded successfully.`n`nInstall now? The Watchdog service will be stopped, the app will close, and it will reopen automatically once the update completes." -f $verText),
+                "Install Update",
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Question
+            )
+
+            if ($go -eq [System.Windows.MessageBoxResult]::Yes) {
+                try {
+                    Invoke-SelfUpdateInstaller -InstallerPath ([string]$result.InstallerPath)
+                } catch {
+                    Add-GuiLog ("ERROR: Failed to launch installer: {0}" -f $_.Exception.Message)
                     Set-UpdateButtonsEnabled -Enabled $true
-                    Set-UpdateFlowUi -Text ("Update failed: " + $errMsg) -Percent 0 -Show $true -Indeterminate $false
-
-                    [System.Windows.MessageBox]::Show(
-                        $errMsg,
-                        "Update Failed",
-                        [System.Windows.MessageBoxButton]::OK,
-                        [System.Windows.MessageBoxImage]::Error
-                    ) | Out-Null
-                })
-            } catch {
-                Add-GuiLog ("ERROR: Failed to show update error UI: {0}" -f $_.Exception.Message)
+                    Set-UpdateFlowUi -Text ("Update failed to start: " + $_.Exception.Message) -Percent 0 -Show $true -Indeterminate $false
+                    [System.Windows.MessageBox]::Show($_.Exception.Message, "Update Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+                }
+            } else {
+                Add-GuiLog "Self-update: installation postponed by user."
+                Set-UpdateButtonsEnabled -Enabled $true
+                Set-UpdateFlowUi -Text "Update downloaded. Installation postponed." -Percent 0 -Show $false
             }
         }
-    
-    })
+        else {
+            $msg = if ($result -and $result.Error) { [string]$result.Error } else { "Unknown error." }
+            Add-GuiLog ("ERROR: Self-update failed: {0}" -f $msg)
+            Set-UpdateButtonsEnabled -Enabled $true
+            Set-UpdateFlowUi -Text ("Update failed: " + $msg) -Percent 0 -Show $true -Indeterminate $false
+            [System.Windows.MessageBox]::Show($msg, "Update Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        }
+    }
+    catch {
+        try { Add-GuiLog ("ERROR: Self-update completion handler failed: {0}" -f $_.Exception.Message) } catch {}
+        try { Set-UpdateButtonsEnabled -Enabled $true } catch {}
+        try { if ($script:SelfUpdateTimer) { $script:SelfUpdateTimer.Stop() } } catch {}
+        $script:SelfUpdateJob = $null
+    }
+}
 
-    $worker.RunWorkerAsync()
-})
+function Start-WatchdogSelfUpdate {
+    try {
+        if ($script:SelfUpdateJob -and $script:SelfUpdateJob.Async -and -not $script:SelfUpdateJob.Async.IsCompleted) {
+            Add-GuiLog "Self-update: already in progress."
+            return
+        }
+
+        Set-UpdateButtonsEnabled -Enabled $false
+        Set-UpdateFlowUi -Text "Preparing update..." -Percent 0 -Show $true -Indeterminate $true
+        Add-GuiLog "Self-update started."
+
+        # Download to a space-free, writable location to avoid path/quoting issues.
+        $cacheDir = Join-Path $DataDir "update-cache"
+        try { if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null } } catch {}
+        $tempInstaller = Join-Path $cacheDir "WoWWatchdog-Setup.exe"
+
+        $shared = [hashtable]::Synchronized(@{
+            Status        = "Preparing update..."
+            Percent       = 0
+            Indeterminate = $true
+            Logs          = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+        })
+
+        $state = [pscustomobject]@{
+            Owner         = $RepoOwner
+            Repo          = $RepoName
+            AssetName     = "WoWWatchdog-Setup.exe"
+            TempInstaller = $tempInstaller
+            Shared        = $shared
+        }
+
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = "MTA"
+        $rs.ThreadOptions  = "ReuseThread"
+        $rs.Open()
+
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+
+        $null = $ps.AddScript({
+            param($state)
+
+            $shared = $state.Shared
+            function Log([string]$m){ try { $shared.Logs.Enqueue($m) } catch {} }
+            function Set-Prog([string]$t,[int]$p,[bool]$ind){
+                try { $shared.Status = $t; if ($p -ge 0) { $shared.Percent = $p }; $shared.Indeterminate = $ind } catch {}
+            }
+
+            try {
+                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+                Set-Prog "Fetching latest release..." 0 $true
+                Log ("Querying latest release: {0}/{1}" -f $state.Owner, $state.Repo)
+
+                $uri = "https://api.github.com/repos/$($state.Owner)/$($state.Repo)/releases/latest"
+                $headers = @{ "User-Agent" = "WoWWatchdog"; "Accept" = "application/vnd.github+json" }
+                $rel = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+
+                $asset = $null
+                if ($rel.assets) { $asset = $rel.assets | Where-Object { $_.name -eq $state.AssetName } | Select-Object -First 1 }
+                if (-not $asset) {
+                    $names = @()
+                    if ($rel.assets) { $names = $rel.assets | ForEach-Object { $_.name } }
+                    throw ("Could not find {0} in latest release ({1}). Found: {2}" -f $state.AssetName, $rel.tag_name, ($names -join ", "))
+                }
+
+                $out = $state.TempInstaller
+                if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue }
+
+                Set-Prog "Starting download..." 0 $true
+                Log ("Downloading {0}" -f $asset.browser_download_url)
+
+                $req = [System.Net.HttpWebRequest]::Create($asset.browser_download_url)
+                $req.UserAgent = "WoWWatchdog"
+                $req.AllowAutoRedirect = $true
+                $req.Timeout = 60000
+                $req.ReadWriteTimeout = 300000
+                $resp = $req.GetResponse()
+                try {
+                    $total = [int64]$resp.ContentLength
+                    $rstream = $resp.GetResponseStream()
+                    $fstream = [System.IO.File]::Create($out)
+                    try {
+                        $buf = New-Object byte[] 131072
+                        $sofar = [int64]0
+                        $lastPct = -1
+                        while (($read = $rstream.Read($buf, 0, $buf.Length)) -gt 0) {
+                            $fstream.Write($buf, 0, $read)
+                            $sofar += $read
+                            if ($total -gt 0) {
+                                $pct = [int](($sofar / $total) * 100)
+                                if ($pct -ne $lastPct) {
+                                    $lastPct = $pct
+                                    Set-Prog ("Downloading update... {0}%" -f $pct) $pct $false
+                                }
+                            } else {
+                                Set-Prog ("Downloading update... {0:N1} MB" -f ($sofar / 1MB)) 0 $true
+                            }
+                        }
+                    } finally {
+                        $fstream.Close()
+                        $rstream.Close()
+                    }
+                } finally {
+                    $resp.Close()
+                }
+
+                if (-not (Test-Path -LiteralPath $out)) { throw ("Download did not produce a file at: {0}" -f $out) }
+                $fi = Get-Item -LiteralPath $out -ErrorAction Stop
+                if ($fi.Length -lt 200000) { throw ("Downloaded installer is unexpectedly small ({0} bytes). Aborting." -f $fi.Length) }
+
+                Log ("Download complete: {0:N0} bytes." -f $fi.Length)
+                Set-Prog "Download complete." 100 $false
+
+                return [pscustomobject]@{ Ok = $true; Error = $null; InstallerPath = $out; Tag = $rel.tag_name }
+            }
+            catch {
+                Log ("ERROR: " + $_.Exception.Message)
+                return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; InstallerPath = $null; Tag = $null }
+            }
+        }).AddArgument($state) | Out-Null
+
+        $async = $ps.BeginInvoke()
+        $script:SelfUpdateJob = [pscustomobject]@{ PowerShell = $ps; Async = $async; Runspace = $rs; Shared = $shared }
+
+        try { if ($script:SelfUpdateTimer) { $script:SelfUpdateTimer.Stop() } } catch {}
+        $script:SelfUpdateTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:SelfUpdateTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+        $script:SelfUpdateTimer.add_Tick({ Complete-WatchdogSelfUpdateTick })
+        $script:SelfUpdateTimer.Start()
+    }
+    catch {
+        Add-GuiLog ("ERROR: Self-update failed to start: {0}" -f $_.Exception.Message)
+        try { Set-UpdateButtonsEnabled -Enabled $true } catch {}
+        try { Set-UpdateFlowUi -Text ("Update failed to start: " + $_.Exception.Message) -Percent 0 -Show $true -Indeterminate $false } catch {}
+        $script:SelfUpdateJob = $null
+    }
+}
+
+$BtnUpdateNow.Add_Click({ Start-WatchdogSelfUpdate })
 
 $BtnMinimize.Add_Click({ $Window.WindowState = 'Minimized' })
 $BtnClose.Add_Click({ $Window.Close() })

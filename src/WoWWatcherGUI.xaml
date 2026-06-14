@@ -1858,6 +1858,7 @@
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <!-- Version info -->
@@ -1902,7 +1903,7 @@
             </StackPanel>
 
         <!-- Progress / status (initially hidden) -->
-        <StackPanel Grid.Row="1" Margin="0,12,0,0">
+        <StackPanel Grid.Row="2" Margin="0,12,0,0">
 
         <TextBlock x:Name="TxtUpdateFlowStatus"
                     Text=""

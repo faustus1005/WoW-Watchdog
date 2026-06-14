@@ -19,6 +19,12 @@ UninstallDisplayIcon={app}\WoWWatcher.exe
 SetupIconFile=WoWWatchdog.ico
 WizardStyle=modern
 
+; Self-update support: let Restart Manager close any lingering WoWWatcher.exe so
+; the in-use binary can be replaced. The self-updater relaunches the GUI itself,
+; so disable Inno's own restart to avoid launching a second instance.
+CloseApplications=yes
+RestartApplications=no
+
 DisableWelcomePage=no
 DisableReadyMemo=no
 
