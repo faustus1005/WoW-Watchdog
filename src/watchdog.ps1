@@ -434,7 +434,15 @@ $DefaultConfig = [ordered]@{
     WorldserverPort = 8086
     PortCheckTtlSec     = 5
     PortCheckFailTtlSec = 15
-    PortWarmupSec       = 180
+    # Startup grace per role: how long a role may run with its port not yet accepting
+    # connections before the watchdog treats it as wedged and restarts it. Worldserver
+    # can take many minutes to load all maps on slow systems, and MySQL can need a long
+    # InnoDB crash recovery after an unclean stop, so both get generous windows.
+    # PortWarmupSec stays the default for fast-starting roles (Authserver). Raise these
+    # if a role is still restarted mid-startup on very slow hardware.
+    PortWarmupSec        = 180
+    MySQLWarmupSec       = 600
+    WorldserverWarmupSec = 900
     # MySQL graceful-shutdown settings: ask the database to flush and exit cleanly
     # instead of force-killing it. Password is stored in plaintext like the other
     # secrets in this file; leave blank for a passwordless local root account.
@@ -593,17 +601,26 @@ function Resolve-MySQLAdmin {
         return $explicit
     }
 
-    # Otherwise derive it from the folder of the configured MySQL binary (and its
-    # neighbouring bin\ folder, the common repack layout: ...\database\bin\).
-    $mysqlPath = if ($Cfg) { [string]$Cfg.MySQL } else { "" }
-    if ([string]::IsNullOrWhiteSpace($mysqlPath)) { return $null }
+    if (-not $Cfg) { return $null }
 
-    $dir = $null
-    try { $dir = Split-Path -Parent $mysqlPath } catch { }
-    if ([string]::IsNullOrWhiteSpace($dir)) { return $null }
+    # Otherwise derive it from the configured MySQL paths. The admin client ships
+    # alongside the other MySQL/MariaDB binaries — almost always in ...\database\bin\.
+    # Search the folders of both the MySQL launcher (often a .bat one level up) and
+    # the mysql.exe client (MySQLExe, which the GUI already collects and which sits
+    # right next to the admin client), including each one's neighbouring bin\ folder.
+    $searchDirs = New-Object System.Collections.Generic.List[string]
+    foreach ($cfgPath in @([string]$Cfg.MySQL, [string]$Cfg.MySQLExe)) {
+        if ([string]::IsNullOrWhiteSpace($cfgPath)) { continue }
+        $dir = $null
+        try { $dir = Split-Path -Parent $cfgPath } catch { }
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        foreach ($d in @($dir, (Join-Path $dir "bin"))) {
+            if (-not $searchDirs.Contains($d)) { $searchDirs.Add($d) | Out-Null }
+        }
+    }
 
-    foreach ($d in @($dir, (Join-Path $dir "bin"))) {
-        foreach ($name in @("mysqladmin.exe","mariadb-admin.exe")) {
+    foreach ($d in $searchDirs) {
+        foreach ($name in @("mariadb-admin.exe","mysqladmin.exe")) {
             $cand = Join-Path $d $name
             if (Test-Path -LiteralPath $cand) { return $cand }
         }
@@ -1590,15 +1607,23 @@ while ($true) {
         $portCheckTtlSec = [int]$cfg.PortCheckTtlSec
         $portCheckFailTtlSec = [int]$cfg.PortCheckFailTtlSec
         $portWarmupSec = [int]$cfg.PortWarmupSec
+        if ($portWarmupSec -le 0) { $portWarmupSec = 180 }
+        # Worldserver and MySQL can legitimately take far longer to open their port
+        # (map loading / InnoDB recovery); give them their own, more generous windows
+        # so the watchdog does not restart them mid-startup.
+        $mysqlWarmupSec = [int]$cfg.MySQLWarmupSec
+        if ($mysqlWarmupSec -le 0) { $mysqlWarmupSec = 600 }
+        $worldWarmupSec = [int]$cfg.WorldserverWarmupSec
+        if ($worldWarmupSec -le 0) { $worldWarmupSec = 900 }
 
-        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
+        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $mysqlWarmupSec -Cfg $cfg
 
 if (Test-RoleHealthy -Role "MySQL" -ExpectedPath ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
     Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 }
 
 if (Test-RoleHealthy -Role "Authserver" -ExpectedPath ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
-    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
+    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $worldWarmupSec -Cfg $cfg
 }
 
 
