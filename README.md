@@ -98,7 +98,7 @@ Need more detail? Check out the dedicated getting started guide: [docs/getting-s
 
 ### Installation
 
-1. **Download the [Latest Release](https://github.com/faustus1005/WoW-Watchdog/releases/latest).**
+1. **Download the [Latest Release](https://github.com/faustus1005/WoW-Watchdog-SPP-Legion/releases/latest).**
 2. **Run the installer.** Admin rights are required to install the Windows service.
 3. **Launch the app** from the new "WoW Watchdog" desktop shortcut. The service starts automatically after installation.
 4. **Configure the watchdog server paths.**
@@ -121,9 +121,9 @@ This project is licensed under the [MIT License](LICENSE) - see the LICENSE file
 
 ##  Support & Contact
 
-*   🐛 Issues: [GitHub Issues](https://github.com/faustus1005/WoW-Watchdog/issues)
+*   🐛 Issues: [GitHub Issues](https://github.com/faustus1005/WoW-Watchdog-SPP-Legion/issues)
     
-*   💬 Discussions: [GitHub Discussions](https://github.com/faustus1005/WoW-Watchdog/discussions)
+*   💬 Discussions: [GitHub Discussions](https://github.com/faustus1005/WoW-Watchdog-SPP-Legion/discussions)
     
 
 **⭐ Star this repo if you find it helpful!**
