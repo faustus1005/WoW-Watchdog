@@ -1569,7 +1569,7 @@ $Window.AddHandler(
 
         } catch {
             [System.Windows.MessageBox]::Show(
-                "Failed to open link: $($e.Uri.AbsoluteUri)`n$($_.Exception.Message)",
+                "Failed to open link: $($uiEventArgs.Uri.AbsoluteUri)`n$($_.Exception.Message)",
                 "Link Error", "OK", "Error"
             ) | Out-Null
         }
@@ -3409,7 +3409,6 @@ $BtnRunFullBackup.Add_Click({
                     RestartOk=$false
                     RestartError=$restartErr
                     Error=$err
-                    VerboseLogPath = $verboseLogPath
                     Steps=$log.ToArray()
                 }
             }
@@ -4407,8 +4406,8 @@ public static class User32 {
                             }
                         }
 
-                        foreach ($pid in ($toKill | Sort-Object -Descending)) {
-                            try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch { }
+                        foreach ($childPid in ($toKill | Sort-Object -Descending)) {
+                            try { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue } catch { }
                         }
                     } catch { }
 
@@ -5281,7 +5280,7 @@ function Invoke-WithLogLock {
     $mutex = $null
     $hasLock = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "Global\\WoWWatchdog_Log")
+        $mutex = New-Object System.Threading.Mutex($false, "Global\WoWWatchdog_Log")
         $hasLock = $mutex.WaitOne(2000)
     } catch {
         $hasLock = $false
@@ -6167,6 +6166,19 @@ $cfg = [pscustomobject]@{
         }
     }
 
+    # Preserve any top-level config fields this dialog does not manage (e.g.
+    # PortCheckTtlSec, PortCheckFailTtlSec, the API block, and the watchdog's MySQL
+    # graceful-shutdown settings). Without this, rebuilding $cfg from scratch would
+    # drop them on every save; the watchdog would then silently reset them to
+    # defaults on its next config load, wiping user-configured values.
+    if ($Config) {
+        foreach ($prop in $Config.PSObject.Properties) {
+            if (-not $cfg.PSObject.Properties[$prop.Name]) {
+                $cfg | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $prop.Value
+            }
+        }
+    }
+
     $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $ConfigPath -Encoding UTF8
     Add-GuiLog "Configuration saved."
 
@@ -6908,7 +6920,7 @@ function Disconnect-WorldTelnet {
 
     Update-TelnetUiState -Connected $false -Connecting $false
     Set-TelnetStatus -Text "Disconnected" -Brush ([System.Windows.Media.Brushes]::Gold)
-Append-TelnetOutput "[Console ready] Click Connect to begin.\r\n"
+Append-TelnetOutput "[Console ready] Click Connect to begin.`r`n"
 
     if (-not $Silent) {
         Append-TelnetOutput "`r`n[Disconnected]`r`n"
@@ -7239,7 +7251,7 @@ function Send-WorldTelnetLine {
 # Telnet tab event handlers (connect only on click; output always auto-scroll)
 Update-TelnetUiState -Connected $false -Connecting $false
 Set-TelnetStatus -Text "Disconnected" -Brush ([System.Windows.Media.Brushes]::Gold)
-Append-TelnetOutput "[Console ready] Click Connect to begin.\r\n"
+Append-TelnetOutput "[Console ready] Click Connect to begin.`r`n"
 
 $BtnTelnetConnect.Add_Click({ Connect-WorldTelnet })
 $BtnTelnetDisconnect.Add_Click({ Disconnect-WorldTelnet })

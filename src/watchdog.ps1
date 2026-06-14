@@ -107,7 +107,7 @@ function Invoke-WithLogLock {
     $mutex = $null
     $hasLock = $false
     try {
-        $mutex = New-Object System.Threading.Mutex($false, "Global\\WoWWatchdog_Log")
+        $mutex = New-Object System.Threading.Mutex($false, "Global\WoWWatchdog_Log")
         $hasLock = $mutex.WaitOne(2000)
     } catch {
         $hasLock = $false
@@ -664,6 +664,70 @@ function Stop-MySQLGracefully {
 # -------------------------------
 # Stop a service/role.
 # -------------------------------
+function Stop-RoleProcesses {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("MySQL","Authserver","Worldserver")]
+        [string]$Role,
+
+        [string]$ExpectedPath
+    )
+
+    # When the configured path is a concrete .exe, stop only the process(es) whose
+    # image path matches it, so a stop never reaches a same-named process from a
+    # different installation. This mirrors Test-ProcessRoleRunning: a process whose
+    # path cannot be read is treated as ours only when no same-named process is
+    # demonstrably from another install, so we neither orphan our own instance nor
+    # kill someone else's.
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPath) -and $ExpectedPath -match '\.exe$') {
+        $expectedFull = $ExpectedPath
+        try { $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath) } catch { }
+        $expectedName = [System.IO.Path]::GetFileNameWithoutExtension($ExpectedPath)
+
+        $procs = @()
+        try { $procs = @(Get-Process -Name $expectedName -ErrorAction SilentlyContinue) } catch { $procs = @() }
+        if (@($procs).Count -eq 0) { return }
+
+        $toStop              = New-Object System.Collections.Generic.List[object]
+        $unverifiable        = New-Object System.Collections.Generic.List[object]
+        $sawReadableMismatch = $false
+
+        foreach ($proc in $procs) {
+            $procPath = $null
+            try {
+                $procPath = $proc.Path
+                if (-not $procPath) { $procPath = $proc.MainModule.FileName }
+            } catch { $procPath = $null }
+
+            if (-not $procPath) { $unverifiable.Add($proc) | Out-Null; continue }
+
+            try { $procPath = [System.IO.Path]::GetFullPath($procPath) } catch { }
+            if ($procPath -ieq $expectedFull) { $toStop.Add($proc) | Out-Null }
+            else { $sawReadableMismatch = $true }
+        }
+
+        # Only stop unverifiable-path processes when none were demonstrably from
+        # another install (same rule the detector uses to claim the role as ours).
+        if (-not $sawReadableMismatch) {
+            foreach ($p in $unverifiable) { $toStop.Add($p) | Out-Null }
+        }
+
+        foreach ($p in $toStop) {
+            try { $p | Stop-Process -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        return
+    }
+
+    # No resolvable executable (e.g. a .bat launcher, or no config supplied): fall
+    # back to stopping by process-name aliases to handle renamed binaries.
+    foreach ($p in $ProcessAliases[$Role]) {
+        try {
+            Get-Process -Name $p -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
+}
+
 function Stop-Role {
     param(
         [Parameter(Mandatory)]
@@ -683,14 +747,21 @@ function Stop-Role {
         }
     }
 
-    # Stop by process name aliases to handle renamed binaries.
-    foreach ($p in $ProcessAliases[$Role]) {
+    # Resolve the configured executable so we only stop the instance this watchdog
+    # manages, not same-named processes belonging to a different install. A .bat
+    # launcher (common for MySQL) has no exe path, so that case falls back to the
+    # alias-based stop inside Stop-RoleProcesses.
+    $expectedPath = $null
+    if ($Cfg) {
         try {
-            Get-Process -Name $p -ErrorAction SilentlyContinue |
-                Stop-Process -Force -ErrorAction SilentlyContinue
+            $cfgPath = [string]$Cfg.$Role
+            if (-not [string]::IsNullOrWhiteSpace($cfgPath) -and $cfgPath -match '\.exe$') {
+                $expectedPath = $cfgPath
+            }
         } catch { }
     }
 
+    Stop-RoleProcesses -Role $Role -ExpectedPath $expectedPath
     Log "$Role stop requested."
 }
 
@@ -707,13 +778,13 @@ function Stop-All-Gracefully {
     Log "Graceful shutdown initiated."
 
     # Stop in reverse dependency order: World -> Auth -> DB.
-    Stop-Role -Role "Worldserver"
+    Stop-Role -Role "Worldserver" -Cfg $Cfg
     if (-not (Wait-ForRoleDown -Role "Worldserver" -ExpectedPath ([string]$Cfg.Worldserver) -TimeoutSec $WaitTimeoutSec)) {
         Log "Graceful shutdown wait timed out for Worldserver."
     }
     Start-Sleep -Seconds $DelaySec
 
-    Stop-Role -Role "Authserver"
+    Stop-Role -Role "Authserver" -Cfg $Cfg
     if (-not (Wait-ForRoleDown -Role "Authserver" -ExpectedPath ([string]$Cfg.Authserver) -TimeoutSec $WaitTimeoutSec)) {
         Log "Graceful shutdown wait timed out for Authserver."
     }
@@ -798,7 +869,9 @@ function Ensure-Role {
 
         [int]$NegativeCacheTtlSec = 15,
 
-        [int]$PortWarmupSec = 180
+        [int]$PortWarmupSec = 180,
+
+        $Cfg = $null
     )
 
     # Manual hold (GUI-requested stop) — do not restart.
@@ -869,6 +942,26 @@ function Ensure-Role {
         $script:WorldRestartCount = $RestartBurstCount[$Role]
     }
 
+    # If the process is still running at this point it is wedged: up, but its port
+    # never became ready within the warmup window. Relaunching without stopping it
+    # would spawn a *duplicate* instance every cycle (bounded only by the burst cap),
+    # which is exactly the memory-exhaustion failure the burst protection guards
+    # against. Stop the stale instance first so this is a genuine restart, not a
+    # second copy. Skip the relaunch this cycle if it refuses to die, so we never
+    # accumulate duplicates.
+    if ($processRunning) {
+        Log "$Role is running but unhealthy (port $Port not ready after $PortWarmupSec sec warmup) — stopping stale instance before restart."
+        # Pass the config so MySQL recycles via the same graceful shutdown used by
+        # normal stop commands (flush/checkpoint before exit), only force-killing if
+        # the database is unreachable. Without it InnoDB could be terminated mid-write.
+        try { Stop-Role -Role $Role -Cfg $Cfg } catch { Log "ERROR stopping stale $Role: $($_)" }
+        if ($script:PortWarmupStart) { $script:PortWarmupStart.Remove($Role) | Out-Null }
+        if (-not (Wait-ForRoleDown -Role $Role -ExpectedPath $Path -TimeoutSec 15)) {
+            Log "WARNING: stale $Role still running after stop request; deferring relaunch to avoid duplicate instances."
+            return
+        }
+    }
+
     $LastRestart[$Role] = Get-Date
     Log "$Role not running — starting: $Path"
 
@@ -934,12 +1027,12 @@ function Process-Commands {
 
       if (Try-ConsumeCommandFile -Path $CommandFiles.StopWorld) {
         Log "Command processed: command.stop.world"
-        Stop-Role -Role "Worldserver"
+        Stop-Role -Role "Worldserver" -Cfg $Cfg
     }
 
      if (Try-ConsumeCommandFile -Path $CommandFiles.StopAuthserver) {
         Log "Command processed: command.stop.auth"
-        Stop-Role -Role "Authserver"
+        Stop-Role -Role "Authserver" -Cfg $Cfg
     }
 
     if (Try-ConsumeCommandFile -Path $CommandFiles.StopMySQL) {
@@ -1498,14 +1591,14 @@ while ($true) {
         $portCheckFailTtlSec = [int]$cfg.PortCheckFailTtlSec
         $portWarmupSec = [int]$cfg.PortWarmupSec
 
-        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+        Ensure-Role -Role "MySQL" -Path ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 
 if (Test-RoleHealthy -Role "MySQL" -ExpectedPath ([string]$cfg.MySQL) -Port (Get-RolePort -Cfg $cfg -Role "MySQL") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
-    Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+    Ensure-Role -Role "Authserver" -Path ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 }
 
 if (Test-RoleHealthy -Role "Authserver" -ExpectedPath ([string]$cfg.Authserver) -Port (Get-RolePort -Cfg $cfg -Role "Authserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec) {
-    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec
+    Ensure-Role -Role "Worldserver" -Path ([string]$cfg.Worldserver) -Port (Get-RolePort -Cfg $cfg -Role "Worldserver") -CacheTtlSec $portCheckTtlSec -NegativeCacheTtlSec $portCheckFailTtlSec -PortWarmupSec $portWarmupSec -Cfg $cfg
 }
 
 
