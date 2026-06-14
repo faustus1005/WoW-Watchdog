@@ -954,7 +954,7 @@ function Ensure-Role {
         # Pass the config so MySQL recycles via the same graceful shutdown used by
         # normal stop commands (flush/checkpoint before exit), only force-killing if
         # the database is unreachable. Without it InnoDB could be terminated mid-write.
-        try { Stop-Role -Role $Role -Cfg $Cfg } catch { Log "ERROR stopping stale $Role: $($_)" }
+        try { Stop-Role -Role $Role -Cfg $Cfg } catch { Log "ERROR stopping stale ${Role}: $($_)" }
         if ($script:PortWarmupStart) { $script:PortWarmupStart.Remove($Role) | Out-Null }
         if (-not (Wait-ForRoleDown -Role $Role -ExpectedPath $Path -TimeoutSec 15)) {
             Log "WARNING: stale $Role still running after stop request; deferring relaunch to avoid duplicate instances."
