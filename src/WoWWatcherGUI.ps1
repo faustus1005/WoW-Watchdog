@@ -4697,18 +4697,58 @@ function Get-WowWatchdogService {
     try { return Get-Service -Name $ServiceName -ErrorAction Stop } catch { return $null }
 }
 
+# Tracks consecutive failures to query the service status so a persistent
+# permissions problem is logged once, while transient blips during service
+# start/stop transitions are absorbed silently.
+$script:ServiceStatusQueryFailures = 0
+$script:ServiceStatusQueryLogged   = $false
+
+function Get-WowWatchdogServiceStatus {
+    # Returns the service status as a string ("Running", "Stopped", ...),
+    # "NotInstalled" when the service does not exist, or $null when the service
+    # exists but its status cannot be queried this tick. Get-Service yields a
+    # lazy ServiceController; the Service Control Manager is not actually queried
+    # until .Status is read, so that read must be guarded here rather than left
+    # to bubble up to the timer as a "TIMER ERROR (...): Access is denied".
+    $svc = Get-WowWatchdogService
+    if (-not $svc) { return "NotInstalled" }
+
+    try {
+        $status = $svc.Status.ToString()
+        if ($script:ServiceStatusQueryFailures -ne 0 -or $script:ServiceStatusQueryLogged) {
+            $script:ServiceStatusQueryFailures = 0
+            $script:ServiceStatusQueryLogged   = $false
+        }
+        return $status
+    } catch {
+        $script:ServiceStatusQueryFailures++
+        # Only surface the problem once it is clearly persistent (a few seconds
+        # of solid failure), so transient SCM contention stays quiet but a real
+        # permissions issue (declined UAC / portable non-elevated) is visible.
+        if ($script:ServiceStatusQueryFailures -ge 10 -and -not $script:ServiceStatusQueryLogged) {
+            Add-GuiLog ("Cannot query the '{0}' service status ({1}). If this persists, run WoW Watchdog as Administrator." -f $ServiceName, $_.Exception.Message)
+            $script:ServiceStatusQueryLogged = $true
+        }
+        return $null
+    }
+}
+
 function Update-ServiceStatusLabel {
     if (-not $TxtServiceStatus) { return }
 
-    $svc = Get-WowWatchdogService
-    if (-not $svc) {
+    $status = Get-WowWatchdogServiceStatus
+    if ($status -eq "NotInstalled") {
         $TxtServiceStatus.Text = "Not installed"
         $TxtServiceStatus.Foreground = [System.Windows.Media.Brushes]::Orange
         return
     }
+    if ($null -eq $status) {
+        # Status query failed this tick; keep the last shown value.
+        return
+    }
 
-    $TxtServiceStatus.Text = $svc.Status.ToString()
-    switch ($svc.Status) {
+    $TxtServiceStatus.Text = $status
+    switch ($status) {
         "Running" { $TxtServiceStatus.Foreground = [System.Windows.Media.Brushes]::LimeGreen }
         "Stopped" { $TxtServiceStatus.Foreground = [System.Windows.Media.Brushes]::Red }
         default   { $TxtServiceStatus.Foreground = [System.Windows.Media.Brushes]::Yellow }
@@ -4814,14 +4854,20 @@ function Set-PriorityOverrideCombo {
 }
 
 function Update-WatchdogStatusLabel {
-    $svc = Get-WowWatchdogService
-    if (-not $svc) {
+    $status = Get-WowWatchdogServiceStatus
+    if ($status -eq "NotInstalled") {
         $TxtWatchdogStatus.Text = "Not installed"
         $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Orange
         return
     }
 
-    if ($svc.Status -ne 'Running') {
+    if ($null -eq $status) {
+        # Service exists but its status could not be queried this tick
+        # (transient SCM contention). Keep the previous label rather than flap.
+        return
+    }
+
+    if ($status -ne 'Running') {
         $TxtWatchdogStatus.Text = "Stopped"
         $TxtWatchdogStatus.Foreground = [System.Windows.Media.Brushes]::Orange
         return
